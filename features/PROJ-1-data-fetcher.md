@@ -1,8 +1,8 @@
 # PROJ-1: Data Fetcher
 
-## Status: Planned
+## Status: In Progress
 **Created:** 2026-03-09
-**Last Updated:** 2026-03-09
+**Last Updated:** 2026-03-11
 
 ## Dependencies
 - None
@@ -42,7 +42,135 @@
 <!-- Sections below are added by subsequent skills -->
 
 ## Tech Design (Solution Architect)
-_To be added by /architecture_
+
+### Overview
+
+A Python-powered backend service that fetches, caches, and serves historical OHLCV data from two sources (Dukascopy, yfinance). Uses a **hybrid cache strategy**: actual data stored as Parquet files on disk for fast bulk reads; cache metadata stored in Supabase for queryability and UI integration.
+
+---
+
+### Component Structure
+
+```
+Data Fetcher System
++-- FastAPI Service (Python)
+|   +-- GET  /data/fetch       ← request OHLCV data for a symbol + range
+|   +-- GET  /data/available   ← list cached datasets (reads from Supabase)
+|   +-- DELETE /data/cache     ← force-refresh (invalidate cache + DB row)
+|
++-- Data Sources (Python modules)
+|   +-- Dukascopy Fetcher      ← intraday 1m data (XAUUSD, GER30, Forex)
+|   +-- yfinance Fetcher       ← daily data (stocks, ETFs, indices)
+|
++-- Resampler                  ← 1m → 5m / 15m / 1h / 1d aggregation
+|
++-- Cache Layer (Hybrid)
+|   +-- /data/cache/           ← Parquet files on disk (actual OHLCV rows)
+|   +-- Supabase: data_cache   ← metadata only (symbol, dates, file path)
+|
++-- Next.js API Proxy
+    +-- /api/data/fetch        ← forwards to FastAPI, adds auth check
+    +-- /api/data/available    ← forwards to FastAPI, adds auth check
+    +-- /api/data/cache        ← forwards to FastAPI, adds auth check
+```
+
+---
+
+### Data Model
+
+**OHLCV Record** — stored in Parquet files on disk:
+```
+- datetime   UTC timestamp
+- open       Opening price
+- high       Highest price in the period
+- low        Lowest price in the period
+- close      Closing price (adjusted close for daily yfinance data)
+- volume     Trade volume (0 for Forex if unavailable)
+```
+
+**Cache Metadata** — one row per Parquet file, stored in Supabase:
+```
+- id               UUID
+- symbol           e.g. "XAUUSD", "GER30", "SPY"
+- source           "dukascopy" or "yfinance"
+- timeframe        "1m", "5m", "15m", "1h", "1d"
+- start_date       UTC date (actual data start)
+- end_date         UTC date (actual data end)
+- file_path        Path to the Parquet file on disk
+- file_size_bytes  Size of the Parquet file
+- row_count        Number of OHLCV rows
+- downloaded_at    Timestamp of last download
+```
+
+> Storage estimate: ~300 bytes per cache entry. 500 files ≈ 150 KB in Supabase.
+> The 500 MB free tier limit is not a concern for realistic solo-trader usage.
+
+**Data Request** — what callers send:
+```
+- symbol          e.g. "XAUUSD", "GER30", "SPY"
+- source          "dukascopy" or "yfinance"
+- timeframe       "1m", "5m", "15m", "1h", "1d"
+- start_date      UTC date
+- end_date        UTC date
+- force_refresh   boolean (skip cache, re-download)
+```
+
+---
+
+### Request Flow
+
+```
+1. Frontend or backtesting engine requests data
+2. Next.js API route verifies user is authenticated (PROJ-8)
+3. Request forwarded to FastAPI service
+4. FastAPI queries Supabase data_cache for a matching entry
+   → Cache HIT:  load Parquet file from disk, return data
+   → Cache MISS: download from Dukascopy or yfinance
+5. Downloaded data cleaned:
+   - Remove weekend/holiday rows
+   - Normalize timezone to UTC
+   - Validate no duplicate timestamps or unexpected gaps
+6. Data saved as Parquet file to /data/cache/
+7. Metadata row written to Supabase data_cache table
+8. If timeframe > 1m: resample using OHLCV aggregation rules
+   (open=first, high=max, low=min, close=last, volume=sum)
+9. Return clean OHLCV dataset
+```
+
+---
+
+### Tech Decisions
+
+| Decision | Choice | Why |
+|---|---|---|
+| Python web framework | FastAPI + Uvicorn | Async support, auto-generated API docs, easy to extend for backtesting engine (PROJ-2) |
+| Cache format | Parquet (via pandas + pyarrow) | Columnar, compressed, pandas-native — ideal for large time-series bulk reads |
+| Cache metadata | Supabase (data_cache table) | Queryable from UI, consistent with rest of stack, negligible storage cost |
+| Intraday data | `duka` library | Purpose-built for Dukascopy HTTP downloads |
+| Daily data | `yfinance` library | De-facto standard, adjusted close built-in |
+| Communication | Next.js proxies to FastAPI | Auth stays in Next.js; Python service never exposed directly to browser |
+| Resampling | pandas `resample()` | Correct OHLCV aggregation rules, well-tested |
+
+---
+
+### New Dependencies
+
+**Python:**
+- `fastapi` + `uvicorn` — web server
+- `pandas` + `pyarrow` — data manipulation and Parquet I/O
+- `duka` — Dukascopy data downloader
+- `yfinance` — Yahoo Finance data
+
+**Next.js:** no new packages
+
+**Supabase:** one new table (`data_cache`) — metadata only, no OHLCV rows in the database
+
+---
+
+### What Does NOT Change
+
+- No new UI pages (this is infrastructure for PROJ-5)
+- Existing auth system (PROJ-8) reused as-is for all API routes
 
 ## QA Test Results
 _To be added by /qa_
