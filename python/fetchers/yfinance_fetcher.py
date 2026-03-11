@@ -11,7 +11,7 @@ from datetime import date, timedelta
 import pandas as pd
 import yfinance as yf
 
-from python.config import FETCH_TIMEOUT_SECONDS
+from config import FETCH_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 

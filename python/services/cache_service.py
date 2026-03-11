@@ -16,7 +16,7 @@ from typing import Optional
 import pandas as pd
 from supabase import create_client, Client
 
-from python.config import SUPABASE_URL, SUPABASE_SERVICE_KEY, DATA_DIR
+from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, DATA_DIR
 
 logger = logging.getLogger(__name__)
 

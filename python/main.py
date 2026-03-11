@@ -11,12 +11,12 @@ import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from python.models import FetchRequest, FetchResponse, ErrorResponse
-from python.fetchers.dukascopy_fetcher import fetch_dukascopy
-from python.fetchers.yfinance_fetcher import fetch_yfinance, VALID_INTERVALS as YFINANCE_INTERVALS
-from python.services.auth import verify_jwt
-from python.services.cache_service import find_cached_entry, load_cached_data, save_to_cache, delete_cache_entry
-from python.services.resampler import resample_ohlcv, TIMEFRAME_TO_RULE
+from models import FetchRequest, FetchResponse, ErrorResponse
+from fetchers.dukascopy_fetcher import fetch_dukascopy
+from fetchers.yfinance_fetcher import fetch_yfinance, VALID_INTERVALS as YFINANCE_INTERVALS
+from services.auth import verify_jwt
+from services.cache_service import find_cached_entry, load_cached_data, save_to_cache, delete_cache_entry
+from services.resampler import resample_ohlcv, TIMEFRAME_TO_RULE
 
 # Configure logging
 logging.basicConfig(
@@ -268,4 +268,4 @@ async def delete_cache(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("python.main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

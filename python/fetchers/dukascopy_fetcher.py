@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from python.config import FETCH_TIMEOUT_SECONDS
+from config import FETCH_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 

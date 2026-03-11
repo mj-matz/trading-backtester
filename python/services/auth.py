@@ -7,7 +7,7 @@ from fastapi import HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 
-from python.config import SUPABASE_JWT_SECRET
+from config import SUPABASE_JWT_SECRET
 
 _bearer = HTTPBearer()
 
