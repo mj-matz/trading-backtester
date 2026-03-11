@@ -12,7 +12,7 @@
 
 | ID | Feature | Status | Spec | Created |
 |----|---------|--------|------|---------|
-| PROJ-1 | Data Fetcher (Dukascopy + yfinance) | In Review | [PROJ-1-data-fetcher.md](PROJ-1-data-fetcher.md) | 2026-03-09 |
+| PROJ-1 | Data Fetcher (Dukascopy + yfinance) | Deployed | [PROJ-1-data-fetcher.md](PROJ-1-data-fetcher.md) | 2026-03-09 |
 | PROJ-2 | Backtesting Engine | Planned | [PROJ-2-backtesting-engine.md](PROJ-2-backtesting-engine.md) | 2026-03-09 |
 | PROJ-3 | Time-Range Breakout Strategy | Planned | [PROJ-3-time-range-breakout-strategy.md](PROJ-3-time-range-breakout-strategy.md) | 2026-03-09 |
 | PROJ-4 | Performance Analytics | Planned | [PROJ-4-performance-analytics.md](PROJ-4-performance-analytics.md) | 2026-03-09 |

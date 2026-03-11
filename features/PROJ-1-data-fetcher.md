@@ -1,6 +1,6 @@
 # PROJ-1: Data Fetcher
 
-## Status: In Review
+## Status: Deployed
 **Created:** 2026-03-09
 **Last Updated:** 2026-03-11
 
@@ -228,4 +228,18 @@ Data Fetcher System
 All critical and high severity bugs resolved. Remaining open items (BUG-6, BUG-15) are low severity and do not block deployment.
 
 ## Deployment
-_To be added by /deploy_
+
+**Deployed:** 2026-03-11
+
+| Component | Platform | URL |
+|-----------|----------|-----|
+| Next.js API proxy (`/api/data/*`) | Vercel | https://trading-backtester-production.up.railway.app (via Vercel frontend) |
+| Python FastAPI service | Railway | https://trading-backtester-production.up.railway.app |
+
+**Environment variables set:**
+- Vercel: `FASTAPI_URL=https://trading-backtester-production.up.railway.app`
+- Railway: `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `SUPABASE_JWT_SECRET`, `DATA_DIR`, `FETCH_TIMEOUT_SECONDS`
+
+**Supabase migrations applied:**
+- `20260311_data_cache` — `data_cache` table + RLS policies
+- `20260312_fix_rls_delete_policy` — DELETE policy uses `app_metadata`
