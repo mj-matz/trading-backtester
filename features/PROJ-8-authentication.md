@@ -1,6 +1,6 @@
 # PROJ-8: Authentication (Admin Login)
 
-## Status: In Progress
+## Status: Deployed
 **Created:** 2026-03-10
 **Last Updated:** 2026-03-10
 
@@ -186,4 +186,7 @@ Request comes in
 ### Production Ready: YES
 
 ## Deployment
-_To be added by /deploy_
+
+- **Production URL:** https://trading-backtester-omega.vercel.app
+- **Deployed:** 2026-03-11
+- **Status:** Live
