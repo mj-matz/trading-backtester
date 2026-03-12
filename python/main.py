@@ -1,15 +1,21 @@
-"""FastAPI service for the Data Fetcher (PROJ-1).
+"""FastAPI service for the Data Fetcher (PROJ-1) and Backtesting Engine (PROJ-2).
 
-Provides endpoints for fetching, caching, and serving historical OHLCV data
-from Dukascopy (intraday) and Yahoo Finance (daily).
+Provides endpoints for fetching/caching historical OHLCV data and running
+backtests against cached data sets.
 """
 
 import logging
-from datetime import date
+import threading
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from typing import List, Literal, Optional
 
+import numpy as np
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
 
 from models import FetchRequest, FetchResponse, ErrorResponse
 from fetchers.dukascopy_fetcher import fetch_dukascopy
@@ -17,6 +23,10 @@ from fetchers.yfinance_fetcher import fetch_yfinance, VALID_INTERVALS as YFINANC
 from services.auth import verify_jwt
 from services.cache_service import find_cached_entry, load_cached_data, save_to_cache, delete_cache_entry
 from services.resampler import resample_ohlcv, TIMEFRAME_TO_RULE
+from engine import run_backtest
+from engine.models import BacktestConfig, InstrumentConfig
+from analytics import calculate_analytics
+from analytics.trade_metrics import r_multiple as compute_r_multiple
 
 # Configure logging
 logging.basicConfig(
@@ -263,6 +273,309 @@ async def delete_cache(
         raise HTTPException(status_code=404, detail=f"Cache entry {cache_id} not found")
 
     return {"success": True, "deleted_id": cache_id}
+
+
+# ── Backtest rate limiter (in-memory, per user, sliding 1-minute window) ────
+_rl_lock = threading.Lock()
+_rl_timestamps: dict = defaultdict(list)
+BACKTEST_RATE_LIMIT = 30  # requests per minute
+
+
+def _check_backtest_rate_limit(user_id: str) -> bool:
+    """Return True if the request is within the rate limit, False if exceeded."""
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(minutes=1)
+    with _rl_lock:
+        times = _rl_timestamps[user_id]
+        times[:] = [t for t in times if t > window_start]
+        if len(times) >= BACKTEST_RATE_LIMIT:
+            return False
+        times.append(now)
+        return True
+
+
+# ── Backtest request / response models ──────────────────────────────────────
+
+class InstrumentConfigRequest(BaseModel):
+    pip_size: float = Field(gt=0)
+    pip_value_per_lot: float = Field(gt=0)
+
+
+class BacktestConfigRequest(BaseModel):
+    initial_balance: float = Field(gt=0)
+    sizing_mode: Literal["fixed_lot", "risk_percent"]
+    instrument: InstrumentConfigRequest
+    fixed_lot: Optional[float] = Field(default=None, gt=0)
+    risk_percent: Optional[float] = Field(default=None, gt=0, le=100)
+    commission: float = Field(default=0.0, ge=0)
+    slippage_pips: float = Field(default=0.0, ge=0)
+    time_exit: Optional[str] = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")  # "HH:MM" (BUG-10)
+    timezone: str = "UTC"                                                                    # IANA timezone (BUG-7)
+    trail_trigger_pips: Optional[float] = Field(default=None, gt=0)
+    trail_lock_pips: Optional[float] = Field(default=None, gt=0)                            # BUG-9: was ge=0
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except ZoneInfoNotFoundError:
+            raise ValueError(f"Invalid IANA timezone: '{v}'")
+        return v
+
+
+class SignalEntry(BaseModel):
+    """One bar's worth of entry signals.  All price fields are optional."""
+    ts: str                               # ISO-8601 timestamp matching the OHLCV index
+    long_entry: Optional[float] = None
+    long_sl: Optional[float] = None
+    long_tp: Optional[float] = None
+    short_entry: Optional[float] = None
+    short_sl: Optional[float] = None
+    short_tp: Optional[float] = None
+    signal_expiry: Optional[str] = None   # ISO-8601 timestamp; None = no expiry (BUG-8)
+    trail_trigger_pips: Optional[float] = None  # per-signal override (BUG-8)
+    trail_lock_pips: Optional[float] = None     # per-signal override (BUG-8)
+
+
+class BacktestRunRequest(BaseModel):
+    cache_id: str
+    config: BacktestConfigRequest
+    signals: List[SignalEntry] = Field(min_length=1, max_length=500_000)
+
+
+class TradeResponse(BaseModel):
+    entry_time: str
+    entry_price: float
+    exit_time: str
+    exit_price: float
+    exit_reason: str
+    direction: str
+    lot_size: float
+    pnl_pips: float
+    pnl_currency: float
+    initial_risk_pips: float
+    initial_risk_currency: float
+    r_multiple: Optional[float] = None
+
+
+class MetricResponse(BaseModel):
+    name: str
+    value: Optional[float]  # None for undefined
+    value_string: Optional[str] = None  # Set to "Infinity" when value is float('inf')
+    unit: str
+    note: Optional[str] = None
+
+
+class MonthlyRResponse(BaseModel):
+    month: str
+    r_earned: Optional[float]
+    trade_count: int
+
+
+class AnalyticsResponse(BaseModel):
+    summary: List[MetricResponse]
+    monthly_r: List[MonthlyRResponse]
+
+
+class BacktestRunResponse(BaseModel):
+    trades: List[TradeResponse]
+    equity_curve: List[dict]
+    final_balance: float
+    initial_balance: float
+    analytics: Optional[AnalyticsResponse] = None
+
+
+# ── /backtest/run endpoint ───────────────────────────────────────────────────
+
+@app.post("/backtest/run", response_model=BacktestRunResponse)
+async def backtest_run(
+    request: BacktestRunRequest,
+    token: dict = Depends(verify_jwt),
+):
+    """
+    Run a backtest against a previously cached OHLCV dataset.
+
+    - Resolves cache_id → file_path via Supabase data_cache.
+    - Loads the Parquet file from disk.
+    - Aligns provided signals with the OHLCV index.
+    - Runs the backtesting engine and returns the full result.
+
+    Rate limit: 30 requests / minute per user.
+    Any authenticated user may call this endpoint.
+    """
+    user_id: str = token["sub"]
+
+    if not _check_backtest_rate_limit(user_id):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded: max 30 backtest requests per minute.",
+        )
+
+    # ── 1. Resolve cache_id → file_path ─────────────────────────────────────
+    from services.cache_service import _get_supabase_client  # reuse existing helper
+
+    try:
+        client = _get_supabase_client()
+        resp = (
+            client.table("data_cache")
+            .select("file_path")
+            .eq("id", request.cache_id)
+            .eq("created_by", user_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        logger.error(f"Supabase lookup failed for cache_id={request.cache_id}: {e}")
+        raise HTTPException(status_code=502, detail="Failed to query data cache.")
+
+    if not resp.data:
+        raise HTTPException(
+            status_code=404, detail=f"cache_id '{request.cache_id}' not found."
+        )
+
+    file_path: str = resp.data["file_path"]
+
+    # ── 2. Load OHLCV from Parquet ───────────────────────────────────────────
+    try:
+        df = load_cached_data(file_path)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Parquet file for cache_id '{request.cache_id}' not found on disk.",
+        )
+    except Exception as e:
+        logger.error(f"Parquet load error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to load data.")
+
+    # Normalise to DatetimeIndex (the Parquet stores datetime as a column)
+    if "datetime" in df.columns:
+        df = df.set_index("datetime")
+    df.index = pd.to_datetime(df.index, utc=True)
+    df.columns = [c.lower() for c in df.columns]
+
+    required_cols = {"open", "high", "low", "close"}
+    if not required_cols.issubset(set(df.columns)):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cached data is missing required columns: {required_cols - set(df.columns)}",
+        )
+
+    # ── 3. Build signals DataFrame aligned to OHLCV index ───────────────────
+    price_cols = ["long_entry", "long_sl", "long_tp", "short_entry", "short_sl", "short_tp",
+                  "trail_trigger_pips", "trail_lock_pips"]
+    signals_df = pd.DataFrame(np.nan, index=df.index, columns=price_cols + ["signal_expiry"], dtype=object)
+    signals_df[price_cols] = signals_df[price_cols].astype(float)
+
+    unmatched: List[str] = []
+    for entry in request.signals:
+        try:
+            ts = pd.Timestamp(entry.ts).tz_convert("UTC")
+        except Exception:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid signal timestamp: '{entry.ts}'"
+            )
+        if ts not in signals_df.index:
+            unmatched.append(entry.ts)
+            continue
+        for col in price_cols:
+            val = getattr(entry, col, None)
+            if val is not None:
+                signals_df.at[ts, col] = val
+        if entry.signal_expiry is not None:
+            try:
+                signals_df.at[ts, "signal_expiry"] = pd.Timestamp(entry.signal_expiry).tz_convert("UTC")
+            except Exception:
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid signal_expiry timestamp: '{entry.signal_expiry}'"
+                )
+
+    if unmatched:
+        logger.warning(
+            f"Backtest {request.cache_id}: {len(unmatched)} signal timestamps "
+            f"did not match any OHLCV bar and were skipped."
+        )
+
+    # ── 4. Build engine config and run ──────────────────────────────────────
+    cfg = request.config
+    engine_config = BacktestConfig(
+        initial_balance=cfg.initial_balance,
+        sizing_mode=cfg.sizing_mode,
+        instrument=InstrumentConfig(
+            pip_size=cfg.instrument.pip_size,
+            pip_value_per_lot=cfg.instrument.pip_value_per_lot,
+        ),
+        fixed_lot=cfg.fixed_lot,
+        risk_percent=cfg.risk_percent,
+        commission=cfg.commission,
+        slippage_pips=cfg.slippage_pips,
+        time_exit=cfg.time_exit,
+        timezone=cfg.timezone,
+        trail_trigger_pips=cfg.trail_trigger_pips,
+        trail_lock_pips=cfg.trail_lock_pips,
+    )
+
+    try:
+        result = run_backtest(df, signals_df, engine_config)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Backtest engine error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal engine error.")
+
+    # ── 5. Compute analytics ─────────────────────────────────────────────────
+    try:
+        analytics_result = calculate_analytics(result)
+        analytics_out = AnalyticsResponse(
+            summary=[
+                MetricResponse(
+                    name=m.name,
+                    value=None if (m.value is None or m.value == float("inf")) else m.value,
+                    value_string="Infinity" if m.value == float("inf") else None,
+                    unit=m.unit,
+                    note=m.note,
+                )
+                for m in analytics_result.summary
+            ],
+            monthly_r=[
+                MonthlyRResponse(
+                    month=mr.month,
+                    r_earned=mr.r_earned,
+                    trade_count=mr.trade_count,
+                )
+                for mr in analytics_result.monthly_r
+            ],
+        )
+    except Exception as e:
+        logger.error(f"Analytics calculation error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Analytics calculation failed.")
+
+    # ── 6. Serialise and return ──────────────────────────────────────────────
+    trades_out = [
+        TradeResponse(
+            entry_time=t.entry_time.isoformat(),
+            entry_price=t.entry_price,
+            exit_time=t.exit_time.isoformat(),
+            exit_price=t.exit_price,
+            exit_reason=t.exit_reason,
+            direction=t.direction,
+            lot_size=t.lot_size,
+            pnl_pips=t.pnl_pips,
+            pnl_currency=t.pnl_currency,
+            initial_risk_pips=t.initial_risk_pips,
+            initial_risk_currency=t.initial_risk_currency,
+            r_multiple=compute_r_multiple(t),
+        )
+        for t in result.trades
+    ]
+
+    return BacktestRunResponse(
+        trades=trades_out,
+        equity_curve=result.equity_curve,
+        final_balance=result.final_balance,
+        initial_balance=result.initial_balance,
+        analytics=analytics_out,
+    )
 
 
 if __name__ == "__main__":

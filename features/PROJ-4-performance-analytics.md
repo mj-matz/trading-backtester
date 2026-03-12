@@ -1,8 +1,8 @@
 # PROJ-4: Performance Analytics
 
-## Status: Planned
+## Status: In Review
 **Created:** 2026-03-09
-**Last Updated:** 2026-03-09
+**Last Updated:** 2026-03-12
 
 ## Dependencies
 - Requires: PROJ-2 (Backtesting Engine) — analytics consumes the trade log and equity curve produced by the engine
@@ -74,10 +74,101 @@
 <!-- Sections below are added by subsequent skills -->
 
 ## Tech Design (Solution Architect)
-_To be added by /architecture_
+
+### Overview
+Pure Python calculation module that consumes `BacktestResult` from the engine and produces a structured metrics object. No database tables needed — analytics are computed on-the-fly after each backtest run.
+
+### Data Flow
+```
+BacktestEngine (PROJ-2)
+        |
+        | BacktestResult (trades, equity_curve, balances)
+        v
+AnalyticsCalculator (PROJ-4)  <-- also receives initial_capital, pip_value
+        |
+        | AnalyticsResult (summary_metrics, monthly_r_breakdown)
+        v
+/api/backtest/run  (existing Next.js route — response extended with analytics field)
+        |
+        v
+Backtest Results UI (PROJ-5)
+```
+
+### Module Structure
+```
+python/analytics/
+  __init__.py
+  calculator.py       Main entry point — orchestrates all calculations
+  trade_metrics.py    Win rate, Profit Factor, R-multiples, streaks, avg duration
+  equity_metrics.py   Total Return, CAGR, Max Drawdown, Max Drawdown Duration
+  risk_metrics.py     Sharpe Ratio and Sortino Ratio (daily returns from equity curve)
+  monthly_metrics.py  R-per-month breakdown and Avg R per Month
+  models.py           AnalyticsResult dataclass (the output shape)
+```
+
+### Data Model
+
+**Input to analytics module:**
+| Input | Source | Description |
+|-------|--------|-------------|
+| Trade list | BacktestResult.trades | All closed trades with PnL, risk, timestamps |
+| Equity curve | BacktestResult.equity_curve | Time-series of account balance |
+| Initial capital | BacktestConfig | Starting account balance |
+| Pip value | InstrumentConfig | Monetary value of 1 pip |
+
+**Output — Summary Metrics:**
+A list of 23 metric objects, each with `name`, `value`, `unit` (e.g. `%`, `R`, `currency`, `count`, `days`).
+
+**Output — Monthly R Breakdown:**
+A list of rows: `{ month: "YYYY-MM", r_earned: float, trade_count: int }`
+
+### API Integration
+The existing `/api/backtest/run` route response is **extended** — no new endpoint needed:
+- Current: `{ trades, equity_curve, final_balance }`
+- Extended: `{ trades, equity_curve, final_balance, analytics: { summary, monthly_r } }`
+
+### Tech Decisions
+| Decision | Choice | Reason |
+|----------|--------|--------|
+| Calculation library | pandas + numpy only | Spec requirement; avoids heavy dependencies |
+| Module location | `python/analytics/` package | Mirrors the `python/engine/` pattern |
+| When to compute | After each backtest run | Analytics is cheap (< 10ms); no caching needed |
+| Output format | List of `{name, value, unit}` objects | Frontend renders a table without custom mapping |
+| Edge case handling | Return `null` or `Infinity` explicitly | Required by spec for 0-trade and all-winners cases |
+
+### Dependencies
+- `pandas` — already installed; used for monthly grouping and daily return series
+- `numpy` — available via pandas; used for std deviation (Sharpe/Sortino)
 
 ## QA Test Results
-_To be added by /qa_
+
+**Tested:** 2026-03-12 | **Method:** Code review of all analytics module files, test files, and API routes
+
+### Acceptance Criteria: 6/6 PASSED
+All 25 spec metrics implemented (33 total including pip/currency variants). Structured `Metric` objects with `name`, `value`, `unit`. Zero-trade and all-winners edge cases handled. Infinity serialised as `value=None, value_string="Infinity"` in API layer.
+
+### Edge Cases: 9/9 PASSED
+All 6 spec cases plus 3 additional (negative final balance, CAGR with negative returns, multiple drawdown cycles).
+
+### Bugs Fixed
+| ID | Severity | Description | Resolution |
+|----|----------|-------------|------------|
+| BUG-4 | Medium | Max Drawdown Duration non-zero when no drawdown exists | Fixed in `equity_metrics.py`: return `(0.0, 0.0)` when `max_dd_pct == 0` |
+| BUG-3 | Medium | Profit Factor undefined for all-breakeven trades | Fixed in `trade_metrics.py`: return `1.0` (neutral) when both gross profit and gross loss are 0 |
+
+### Remaining Low-Priority Bugs (deferred)
+- **BUG-1:** `avg_r_per_trade` denominator includes zero-risk trades (ambiguous per spec)
+- **BUG-2:** Module interface differs from spec (accepts `BacktestResult` vs 4 params — functionally equivalent)
+- **BUG-5:** Sharpe Ratio may understate intraday volatility (industry-standard grouping)
+- **BUG-6:** CAGR note not computed when equity curve has < 2 points (no functional impact)
+
+### Security Audit: PASS
+Auth on both Next.js (Supabase) and FastAPI (verify_jwt) layers. Cache filtered by `user_id`. Zod + Pydantic input validation. Rate limiting 30 req/min per user. No secrets, no eval/exec, no injection vectors.
+
+### Regression: PASS
+PROJ-1, PROJ-2, PROJ-3, PROJ-8 — no modifications.
+
+### Verdict: **READY FOR DEPLOYMENT**
 
 ## Deployment
 _To be added by /deploy_

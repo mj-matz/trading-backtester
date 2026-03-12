@@ -1,8 +1,8 @@
 # PROJ-2: Backtesting Engine
 
-## Status: In Progress
+## Status: In Review
 **Created:** 2026-03-09
-**Last Updated:** 2026-03-11
+**Last Updated:** 2026-03-11 (QA complete — 7 bugs fixed, 27 tests passing)
 
 ## Dependencies
 - Requires: PROJ-1 (Data Fetcher) — engine consumes OHLCV DataFrames produced by the fetcher
@@ -143,7 +143,78 @@ No new packages required.
 `POST /api/backtest/run` — accepts BacktestConfig + signals as JSON, returns BacktestResult as JSON.
 
 ## QA Test Results
-_To be added by /qa_
+
+**Tested:** 2026-03-11 | **Method:** Code review + static analysis + pytest
+**Result:** Production-ready after fixes (see below)
+
+### Acceptance Criteria: 16/16 PASSED
+All 16 acceptance criteria verified by code review.
+
+### Edge Cases (from spec): 8/8 PASSED
+All documented edge cases handled correctly.
+
+### Additional Edge Cases Found & Fixed
+
+| ID | Description | Severity | File | Fix Applied |
+|----|-------------|----------|------|-------------|
+| EC-9 | Empty OHLCV input caused `IndexError` at `ohlcv.index[0]` | High | `engine.py:114` | Early return with empty `BacktestResult` |
+| EC-10 | `trail_trigger_pips` set without `trail_lock_pips` caused `TypeError` in `pips_to_price_offset(None, ...)` | High | `position_tracker.py:49` | Default `trail_lock_pips` to `0.0` (breakeven) when `None` |
+
+---
+
+### Bugs Found & Fixed
+
+#### BUG-1 — CRITICAL: Authorization bypass — cache ownership not verified
+- **File:** `python/main.py:383`
+- **Problem:** `/backtest/run` queried `data_cache` by `cache_id` only, allowing any authenticated user to run backtests against another user's cached dataset.
+- **Fix:** Added `.eq("created_by", user_id)` to the Supabase query — cache entries are now scoped to the requesting user.
+
+#### BUG-2 — HIGH: TypeError when `trail_trigger_pips` set without `trail_lock_pips`
+- **File:** `python/engine/position_tracker.py:49`
+- **Problem:** `pips_to_price_offset(None, pip_size)` raised `TypeError`.
+- **Fix:** `lock_pips = config.trail_lock_pips if config.trail_lock_pips is not None else 0.0` — defaults to breakeven (SL moves to entry).
+
+#### BUG-3 — HIGH: IndexError on empty OHLCV DataFrame
+- **File:** `python/engine/engine.py:114`
+- **Problem:** `ohlcv.index[0]` crashed when OHLCV had 0 rows.
+- **Fix:** Added early return guard before the main loop — returns empty `BacktestResult` with initial balance.
+
+#### BUG-4 — MEDIUM: Internal error details leaked in API responses
+- **File:** `python/main.py:411, 476`
+- **Problem:** `detail=f"Engine error: {e}"` and `detail=f"Failed to load data: {e}"` exposed Python exception messages (including potential file paths) to clients.
+- **Fix:** Replaced with generic messages: `"Internal engine error."` and `"Failed to load data."` — full details still logged server-side.
+
+#### BUG-5 — MEDIUM: Invalid `time_exit` values accepted (e.g. `"25:99"`)
+- **Files:** `src/app/api/backtest/run/route.ts:28`, `python/engine/engine.py:27`
+- **Problem:** Zod regex `/^\d{2}:\d{2}$/` allowed out-of-range values; Python `time(25, 99)` raised an unhandled `ValueError` returning a 500.
+- **Fix:** Zod regex changed to `/^([01]\d|2[0-3]):[0-5]\d$/`; Python `_parse_time_exit` wrapped in `try/except` re-raising as `ValueError` with a clear message (caught upstream as HTTP 400).
+
+#### BUG-6 — MEDIUM: OCO always favoured long when both sides triggered on same bar
+- **File:** `python/engine/order_manager.py:17`
+- **Problem:** `_extract_pending_orders` always appended long before short; `evaluate_pending_orders` returned the first triggered — long always won on same-bar conflicts.
+- **Fix:** Refactored `evaluate_pending_orders` to collect all triggered orders first, then select the one whose `entry_price` is closest to `bar_open` (i.e. triggered first). Ties still break in favour of long (documented).
+
+#### BUG-7 — LOW: `datetime.utcnow()` deprecated in Python 3.12+
+- **File:** `python/main.py:283`
+- **Problem:** `datetime.utcnow()` is deprecated since Python 3.12.
+- **Fix:** Replaced with `datetime.now(timezone.utc)`; added `timezone` to imports.
+
+---
+
+### Missing Test Coverage — Added
+
+6 test scenarios were absent from `python/tests/test_engine.py` and have been added:
+
+| Test | Class | Description |
+|------|-------|-------------|
+| `test_short_trail_trigger` | `TestTrailTrigger` | Trail trigger on short trade; SL locks in 20 pip profit |
+| `test_trail_trigger_without_lock_pips_defaults_to_breakeven` | `TestTrailTrigger` | `trail_lock_pips=None` → SL moves to entry (breakeven) |
+| `test_time_exit_fires_on_next_bar_when_exact_bar_missing` | `TestTimeExit` | Gap in bars — `>= exit_time` condition catches next available bar |
+| `test_commission_and_slippage_combined` | `TestCommissionAndSlippage` | Both applied simultaneously; effects are additive |
+| `test_empty_ohlcv_returns_empty_result` | `TestEdgeCases` | Empty OHLCV returns empty result without raising |
+| `test_lot_size_grows_with_balance_after_winning_trade` | `TestRiskPercentCompounding` | After winning trade, next lot size grows proportionally |
+
+**Final test count: 27/27 passed.**
 
 ## Deployment
 _To be added by /deploy_

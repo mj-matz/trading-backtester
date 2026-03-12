@@ -14,8 +14,8 @@
 |----|---------|--------|------|---------|
 | PROJ-1 | Data Fetcher (Dukascopy + yfinance) | Deployed | [PROJ-1-data-fetcher.md](PROJ-1-data-fetcher.md) | 2026-03-09 |
 | PROJ-2 | Backtesting Engine | In Review | [PROJ-2-backtesting-engine.md](PROJ-2-backtesting-engine.md) | 2026-03-09 |
-| PROJ-3 | Time-Range Breakout Strategy | In Progress | [PROJ-3-time-range-breakout-strategy.md](PROJ-3-time-range-breakout-strategy.md) | 2026-03-09 |
-| PROJ-4 | Performance Analytics | Planned | [PROJ-4-performance-analytics.md](PROJ-4-performance-analytics.md) | 2026-03-09 |
+| PROJ-3 | Time-Range Breakout Strategy | In Review | [PROJ-3-time-range-breakout-strategy.md](PROJ-3-time-range-breakout-strategy.md) | 2026-03-09 |
+| PROJ-4 | Performance Analytics | In Review | [PROJ-4-performance-analytics.md](PROJ-4-performance-analytics.md) | 2026-03-09 |
 | PROJ-5 | Backtest UI (Configuration + Results) | Planned | [PROJ-5-backtest-ui.md](PROJ-5-backtest-ui.md) | 2026-03-09 |
 | PROJ-6 | Strategy Library (Plugin System) | Planned | [PROJ-6-strategy-library.md](PROJ-6-strategy-library.md) | 2026-03-09 |
 | PROJ-7 | Trade Journal (Manual) | Planned | [PROJ-7-trade-journal.md](PROJ-7-trade-journal.md) | 2026-03-09 |
