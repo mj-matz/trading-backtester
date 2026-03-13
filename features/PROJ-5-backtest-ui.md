@@ -79,7 +79,119 @@
 <!-- Sections below are added by subsequent skills -->
 
 ## Tech Design (Solution Architect)
-_To be added by /architecture_
+
+### Existing Infrastructure
+- `POST /api/backtest/run` — low-level engine endpoint; requires pre-computed signals (not used directly by the UI)
+- `GET /api/data/*` — data fetch, cache, and availability endpoints
+- Dashboard shell at `/(dashboard)/` with sidebar + auth-protected layout
+- All required shadcn/ui components already installed
+
+### Component Structure
+
+```
+src/app/(dashboard)/backtest/page.tsx   ← NEW route
++-- BacktestPage (2-column layout on desktop, stacked on mobile)
+    |
+    +-- [Left Column] ConfigurationPanel
+    |   +-- StrategySelector (Select: "Time-Range Breakout" + future strategies)
+    |   +-- AssetInput (Input: e.g. XAUUSD, GER30)
+    |   +-- TimeframeSelector (Select: 1m / 5m / 15m / 1h / 1d)
+    |   +-- DateRangePicker (two date Input fields: Start / End)
+    |   +-- StrategyParamsSection (rendered dynamically per selected strategy)
+    |   |   +-- [Time-Range Breakout]
+    |   |       +-- Range Start / Range End (time inputs)
+    |   |       +-- Trigger Deadline / Time Exit (time inputs)
+    |   |       +-- Stop Loss / Take Profit (number inputs, in pips)
+    |   |       +-- Direction (RadioGroup: Long / Short / Both)
+    |   |       +-- Commission / Slippage (number inputs, in pips)
+    |   +-- CapitalSection
+    |   |   +-- Initial Capital (Input, default 10,000)
+    |   |   +-- Sizing Mode (RadioGroup: "Risk %" / "Fixed Lot")
+    |   |   +-- Risk % OR Lot Size (conditional Input based on sizing mode)
+    |   +-- RunBacktestButton (disabled while a run is in progress)
+    |
+    +-- [Right Column] ResultsPanel
+        +-- EmptyState      (before first run — prompt to configure and run)
+          OR LoadingState   (spinner + "Running backtest…" + timeout warning at 30s)
+          OR ErrorState     (user-friendly error message; form stays intact)
+          OR ResultsDashboard
+              +-- MetricsSummaryCard
+              |   +-- Overview group (Total Return, CAGR, Sharpe Ratio)
+              |   +-- Trade Stats group (Win Rate, Avg Win, Avg Loss, Profit Factor)
+              |   +-- Risk group (Max Drawdown, Calmar Ratio, Longest Drawdown)
+              +-- ChartsSection
+              |   +-- EquityCurveChart (Recharts LineChart, x=date, y=balance)
+              |   +-- DrawdownChart (Recharts AreaChart, below equity curve)
+              +-- TradeListSection
+                  +-- SortControls (sort by date / PnL / duration)
+                  +-- TradeTable (columns: #, Date, Direction, Entry, Exit,
+                  |              Lot Size, PnL pips, PnL €, R-Multiple,
+                  |              Exit Reason, Duration)
+                  +-- Pagination (50 trades per page)
+                  +-- SaveRunButton (placeholder — "coming soon" badge; wired up by PROJ-9)
+```
+
+### New API Endpoint
+
+The existing `POST /api/backtest/run` is a low-level engine endpoint that requires pre-computed signals — it is not suitable for direct use from the UI. A new user-facing orchestration endpoint is needed:
+
+```
+POST /api/backtest
+  Input:  symbol, date range, timeframe, strategy name + params, engine config
+  Internally: fetch/cache data → compute signals → run engine → compute analytics
+  Output: { metrics, equity_curve[], drawdown_curve[], trades[] }
+```
+
+This keeps the frontend simple: one request in, full results out. The multi-step pipeline remains hidden on the server.
+
+### User Interaction Flow
+
+1. On page load → last config is restored from `localStorage`
+2. User adjusts parameters → form validates in real time (react-hook-form + Zod)
+3. User clicks "Run Backtest" → button disables, loading state replaces results panel
+4. Frontend calls `POST /api/backtest` with full config JSON
+5. If the request takes > 30s → a timeout warning appears with a cancel option
+6. Response arrives → results are parsed and displayed in ResultsDashboard
+7. Changing parameters does **not** clear results — old results remain until a new run is explicitly started
+
+### Data Model (plain language)
+
+**Form Config** — persisted to `localStorage`, restored on page load:
+- Strategy name, asset/symbol, timeframe
+- Date range (start + end)
+- Strategy parameters (range times, trigger deadline, time exit, SL, TP, direction, commission, slippage)
+- Initial capital, sizing mode, risk % or fixed lot size
+
+**Backtest Result** — held in React state only (not persisted until PROJ-9 adds save):
+- Metrics object (all PROJ-4 analytics values)
+- Equity curve: list of `{ date, balance }` data points
+- Drawdown curve: list of `{ date, drawdown_pct }` data points
+- Trade list: array of trade records (entry, exit, lot size, PnL, R-multiple, exit reason, duration)
+
+### Tech Decisions
+
+| Decision | Choice | Why |
+|----------|--------|-----|
+| Page location | `(dashboard)/backtest/page.tsx` | Inside existing auth-protected dashboard shell |
+| Form library | react-hook-form + Zod | Already used in project; handles conditional fields cleanly |
+| Chart library | Recharts | Spec-mandated; integrates well with shadcn/ui dark theme |
+| Config persistence | localStorage | No server round-trip needed; single-user, single-device scope |
+| Result state | React useState | Results are ephemeral until PROJ-9 adds persistence |
+| Long-running UX | 30s timeout warning + cancel | Prevents confusion without streaming complexity in MVP |
+| API design | New orchestration endpoint | Keeps UI simple; hides multi-step backend pipeline |
+
+### Future Consideration (PROJ-6 or later)
+
+If FastAPI processing regularly exceeds 30 seconds (e.g. large date ranges or tick-level data), replace the simple HTTP request + timeout with **Server-Sent Events (SSE)** or a **WebSocket** connection. This would allow a real progress bar with named stages ("Fetching data…", "Computing signals…", "Running engine…") instead of a generic spinner. The UI component boundary for this is already isolated in `LoadingState`, making the upgrade straightforward.
+
+### New Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| `recharts` | Equity curve + drawdown charts |
+| `date-fns` | Date formatting in chart tooltips and trade table |
+
+(react-hook-form and Zod are already installed)
 
 ## QA Test Results
 _To be added by /qa_
