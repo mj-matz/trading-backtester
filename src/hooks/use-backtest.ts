@@ -14,7 +14,7 @@ interface UseBacktestReturn {
   cancel: () => void;
 }
 
-const TIMEOUT_WARNING_MS = 30_000;
+const TIMEOUT_WARNING_MS = 60_000;
 
 export function useBacktest(): UseBacktestReturn {
   const [status, setStatus] = useState<BacktestStatus>("idle");

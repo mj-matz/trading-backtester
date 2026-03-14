@@ -129,11 +129,17 @@ export interface TradeRecord {
   duration_minutes: number;
 }
 
+export interface SkippedDay {
+  date: string;
+  reason: string;
+}
+
 export interface BacktestResult {
   metrics: BacktestMetrics;
   equity_curve: EquityCurvePoint[];
   drawdown_curve: DrawdownCurvePoint[];
   trades: TradeRecord[];
+  skipped_days: SkippedDay[];
 }
 
 // ── localStorage helpers ─────────────────────────────────────────────────────

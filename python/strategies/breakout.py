@@ -17,6 +17,14 @@ from .base import BaseStrategy
 
 
 @dataclass
+class SkippedDay:
+    """Represents a trading day that was skipped during signal generation."""
+
+    date: str
+    reason: str  # NO_BARS | NO_RANGE_BARS | FLAT_RANGE | NO_SIGNAL_BAR | DEADLINE_MISSED
+
+
+@dataclass
 class BreakoutParams:
     """All user-configurable parameters for the breakout strategy."""
 
@@ -43,6 +51,21 @@ class BreakoutStrategy(BaseStrategy):
             raise ValueError(
                 f"range_end ({params.range_end}) must differ from "
                 f"range_start ({params.range_start}); zero-width ranges are not allowed"
+            )
+        # Compute effective range duration in minutes.
+        # For overnight ranges (range_start > range_end) the window wraps midnight,
+        # e.g. 22:00–02:00 = 4 h. A "range" of 10:00–08:00 would be 22 h — not a
+        # legitimate overnight window, so we cap at MAX_RANGE_MINUTES (12 h).
+        start_min = params.range_start.hour * 60 + params.range_start.minute
+        end_min = params.range_end.hour * 60 + params.range_end.minute
+        duration_min = end_min - start_min if end_min > start_min else end_min - start_min + 24 * 60
+        MAX_RANGE_MINUTES = 12 * 60  # 12 hours
+        if duration_min > MAX_RANGE_MINUTES:
+            raise ValueError(
+                f"range_end ({params.range_end}) results in a range duration of "
+                f"{duration_min // 60}h {duration_min % 60}m, which exceeds the "
+                f"maximum of {MAX_RANGE_MINUTES // 60}h. "
+                f"For overnight ranges use e.g. range_start=22:00, range_end=02:00."
             )
         # For overnight ranges (range_start > range_end) trigger_deadline is on the next
         # calendar day, so the simple time comparison still works (deadline must follow
@@ -94,7 +117,7 @@ class BreakoutStrategy(BaseStrategy):
 
     def generate_signals(
         self, df: pd.DataFrame, params: BreakoutParams
-    ) -> pd.DataFrame:
+    ) -> tuple[pd.DataFrame, list[SkippedDay]]:
         """
         Generate breakout signals from OHLCV data.
 
@@ -107,9 +130,10 @@ class BreakoutStrategy(BaseStrategy):
 
         Returns
         -------
-        pd.DataFrame
-            Same index as df. Signal columns are NaN / NaT except on
-            the first bar after range_end for each valid trading day.
+        tuple[pd.DataFrame, list[SkippedDay]]
+            - DataFrame: Same index as df. Signal columns are NaN / NaT except on
+              the first bar after range_end for each valid trading day.
+            - list[SkippedDay]: Days that were skipped with reason codes.
         """
         self.validate_params(params)
 
@@ -124,8 +148,10 @@ class BreakoutStrategy(BaseStrategy):
             pd.NaT, index=df.index, dtype="datetime64[ns, UTC]"
         )
 
+        skipped_days: list[SkippedDay] = []
+
         if df.empty:
-            return signals
+            return (signals, skipped_days)
 
         tz = ZoneInfo(params.timezone)
 
@@ -149,6 +175,7 @@ class BreakoutStrategy(BaseStrategy):
                 # Overnight range: range_start on `day`, range_end on the next calendar day.
                 # Need a next day to complete the range.
                 if day_idx + 1 >= len(unique_dates):
+                    skipped_days.append(SkippedDay(date=str(day), reason="NO_BARS"))
                     continue
                 next_day = unique_dates[day_idx + 1]
                 next_mask = dates == next_day
@@ -182,6 +209,7 @@ class BreakoutStrategy(BaseStrategy):
 
             # -- Step 1: Validate range
             if len(range_indices) == 0:
+                skipped_days.append(SkippedDay(date=str(day), reason="NO_RANGE_BARS"))
                 continue
 
             range_bars = df.loc[range_indices]
@@ -190,10 +218,12 @@ class BreakoutStrategy(BaseStrategy):
 
             # Skip flat ranges (High == Low)
             if range_high == range_low:
+                skipped_days.append(SkippedDay(date=str(day), reason="FLAT_RANGE"))
                 continue
 
             # -- Step 2: Find first bar after range_end
             if len(after_range_indices) == 0:
+                skipped_days.append(SkippedDay(date=str(day), reason="NO_SIGNAL_BAR"))
                 continue
 
             signal_bar_idx = after_range_indices[0]
@@ -201,6 +231,7 @@ class BreakoutStrategy(BaseStrategy):
             # Check that this bar is within the trigger window
             signal_bar_local_time = pd.Timestamp(signal_bar_idx).tz_convert(tz).time()
             if signal_bar_local_time > params.trigger_deadline:
+                skipped_days.append(SkippedDay(date=str(day), reason="DEADLINE_MISSED"))
                 continue
 
             # -- Step 3: Calculate entry, SL, TP prices
@@ -238,4 +269,4 @@ class BreakoutStrategy(BaseStrategy):
                 signals.at[signal_bar_idx, "trail_trigger_pips"] = params.trail_trigger_pips
                 signals.at[signal_bar_idx, "trail_lock_pips"] = params.trail_lock_pips
 
-        return signals
+        return signals, skipped_days

@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from strategies.breakout import BreakoutStrategy, BreakoutParams
+from strategies.breakout import BreakoutStrategy, BreakoutParams, SkippedDay
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ class TestRangeExtraction:
         ])
 
         params = default_params()
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         # Range High = 101.00 (bar at 08:30), Range Low = 99.50 (bar at 08:00)
         # range_height = 101.00 - 99.50 = 1.50
@@ -102,7 +102,7 @@ class TestRangeExtraction:
             ("2024-01-02T10:00:00Z", 100.20, 100.30, 100.10, 100.25),
         ])
         params = default_params()
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         signal_bar = signals.loc["2024-01-02T10:00:00Z"]
         # Range High = 100.50, Range Low = 99.50
@@ -116,7 +116,7 @@ class TestRangeExtraction:
             ("2024-01-02T10:00:00Z", 100.00, 100.10, 99.90, 100.00),
         ])
         params = default_params()
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         signal_bar = signals.loc["2024-01-02T10:00:00Z"]
         assert np.isnan(signal_bar["long_entry"])
@@ -130,7 +130,7 @@ class TestRangeExtraction:
             ("2024-01-02T10:00:00Z", 100.20, 100.30, 100.10, 100.25),
         ])
         params = default_params()
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         # No range bars exist -> no signal
         signal_bar = signals.loc["2024-01-02T10:00:00Z"]
@@ -153,7 +153,7 @@ class TestLongSignalCalculation:
             take_profit_pips=75.0,
             entry_offset_pips=2.0,
         )
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         # Range High = 102.00, Range Low = 98.00
         # Long entry = 102.00 + 2.0*0.01 = 102.02
@@ -180,7 +180,7 @@ class TestShortSignalCalculation:
             take_profit_pips=75.0,
             entry_offset_pips=2.0,
         )
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         # Range High = 102.00, Range Low = 98.00
         # Short entry = 98.00 - 2.0*0.01  = 97.98
@@ -202,7 +202,7 @@ class TestDirectionFilter:
             ("2024-01-02T10:00:00Z", 100.50, 101.00, 100.20, 100.70),
         ])
         params = default_params(direction_filter="long_only")
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         sig = signals.loc["2024-01-02T10:00:00Z"]
         assert pd.notna(sig["long_entry"])
@@ -219,7 +219,7 @@ class TestDirectionFilter:
             ("2024-01-02T10:00:00Z", 100.50, 101.00, 100.20, 100.70),
         ])
         params = default_params(direction_filter="short_only")
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         sig = signals.loc["2024-01-02T10:00:00Z"]
         assert np.isnan(sig["long_entry"])
@@ -236,7 +236,7 @@ class TestDirectionFilter:
             ("2024-01-02T10:00:00Z", 100.50, 101.00, 100.20, 100.70),
         ])
         params = default_params(direction_filter="both")
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         sig = signals.loc["2024-01-02T10:00:00Z"]
         assert pd.notna(sig["long_entry"])
@@ -257,7 +257,7 @@ class TestTriggerDeadline:
             ("2024-01-02T18:00:00Z", 100.80, 101.00, 100.50, 100.70),
         ])
         params = default_params(trigger_deadline=time(17, 0))
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         sig = signals.loc["2024-01-02T18:00:00Z"]
         assert np.isnan(sig["long_entry"])
@@ -271,7 +271,7 @@ class TestTriggerDeadline:
             ("2024-01-02T17:00:00Z", 100.50, 101.00, 100.20, 100.70),
         ])
         params = default_params(trigger_deadline=time(17, 0))
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         sig = signals.loc["2024-01-02T17:00:00Z"]
         assert pd.notna(sig["long_entry"])
@@ -284,7 +284,7 @@ class TestTriggerDeadline:
             ("2024-01-02T10:00:00Z", 100.50, 101.00, 100.20, 100.70),
         ])
         params = default_params(trigger_deadline=time(17, 0), timezone="UTC")
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         expiry = signals.loc["2024-01-02T10:00:00Z", "signal_expiry"]
         expected = pd.Timestamp("2024-01-02T17:00:00Z")
@@ -306,7 +306,7 @@ class TestSignalGranularity:
             ("2024-01-02T12:00:00Z", 100.60, 100.80, 100.30, 100.50),
         ])
         params = default_params()
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         # Only bar at 10:00 should have signal
         assert pd.notna(signals.loc["2024-01-02T10:00:00Z", "long_entry"])
@@ -324,7 +324,7 @@ class TestSignalGranularity:
             ("2024-01-03T10:00:00Z", 200.50, 201.00, 200.20, 200.70),
         ])
         params = default_params()
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         # Day 1: Range High=102, Low=98
         sig1 = signals.loc["2024-01-02T10:00:00Z"]
@@ -341,10 +341,17 @@ class TestSignalGranularity:
 
 class TestValidateParams:
     def test_validate_params_invalid_range(self):
-        """range_end <= range_start raises ValueError."""
+        """range_end < range_start with >12h duration raises ValueError (BUG-12)."""
         params = default_params(range_start=time(10, 0), range_end=time(8, 0))
         with pytest.raises(ValueError, match="range_end"):
             strategy.validate_params(params)
+
+    def test_validate_params_valid_overnight_range(self):
+        """Legitimate overnight range (22:00–02:00, 4h) is accepted."""
+        params = default_params(
+            range_start=time(22, 0), range_end=time(2, 0), trigger_deadline=time(4, 0)
+        )
+        strategy.validate_params(params)  # must not raise
 
     def test_validate_params_equal_range(self):
         """range_end == range_start raises ValueError."""
@@ -455,7 +462,7 @@ class TestTimezoneConversion:
             trigger_deadline=time(17, 0),
             timezone="Europe/Berlin",
         )
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         # Range computed from 07:00Z and 08:00Z (which are 08:00 and 09:00 CET)
         # Range High = 102.00 (07:00Z), Range Low = 98.00 (07:00Z)
@@ -484,7 +491,7 @@ class TestTimezoneConversion:
             trigger_deadline=time(17, 0),
             timezone="Europe/Berlin",
         )
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         expiry = signals.loc["2024-01-02T09:00:00Z", "signal_expiry"]
         # 17:00 CET on Jan 2 = 16:00 UTC (CET = UTC+1 in January)
@@ -498,7 +505,7 @@ class TestTimezoneConversion:
             ("2024-01-02T10:00:00Z", 100.50, 101.00, 100.20, 100.70),
         ])
         params = default_params(timezone="UTC")
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         sig = signals.loc["2024-01-02T10:00:00Z"]
         assert pd.notna(sig["long_entry"])
@@ -515,7 +522,7 @@ class TestEdgeCases:
         """Empty input DataFrame returns empty signals without error."""
         ohlcv = make_ohlcv([])
         params = default_params()
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         assert len(signals) == 0
         assert "long_entry" in signals.columns
@@ -528,7 +535,7 @@ class TestEdgeCases:
             ("2024-01-02T09:00:00Z", 100.50, 101.50, 99.00, 100.80),
         ])
         params = default_params()
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         assert all(np.isnan(signals["long_entry"]))
         assert all(np.isnan(signals["short_entry"]))
@@ -540,7 +547,7 @@ class TestEdgeCases:
             ("2024-01-02T10:00:00Z", 100.50, 101.00, 100.20, 100.70),
         ])
         params = default_params(entry_offset_pips=0)
-        signals = strategy.generate_signals(ohlcv, params)
+        signals, _ = strategy.generate_signals(ohlcv, params)
 
         sig = signals.loc["2024-01-02T10:00:00Z"]
         assert sig["long_entry"] == pytest.approx(102.00, abs=1e-6)
@@ -642,3 +649,110 @@ class TestEngineExpiryIntegration:
         # Order should trigger at 16:00 (before deadline) and TP at 16:30
         assert len(result.trades) == 1
         assert result.trades[0].exit_reason == "TP"
+
+
+# ── Test: Skipped Days (BUG-11) ──────────────────────────────────────────────
+
+class TestSkippedDays:
+    """Verify that generate_signals reports skipped trading days with the
+    correct reason codes."""
+
+    def test_no_range_bars_reported(self):
+        """When no bars exist in the range window, reason is NO_RANGE_BARS."""
+        ohlcv = make_ohlcv([
+            ("2024-01-02T07:00:00Z", 100.00, 100.50, 99.50, 100.20),
+            ("2024-01-02T10:00:00Z", 100.20, 100.30, 100.10, 100.25),
+        ])
+        params = default_params()
+        signals, skipped = strategy.generate_signals(ohlcv, params)
+
+        assert len(skipped) == 1
+        assert skipped[0].reason == "NO_RANGE_BARS"
+        assert skipped[0].date == "2024-01-02"
+
+    def test_flat_range_reported(self):
+        """When Range High == Range Low, reason is FLAT_RANGE."""
+        ohlcv = make_ohlcv([
+            ("2024-01-02T08:00:00Z", 100.00, 100.00, 100.00, 100.00),
+            ("2024-01-02T10:00:00Z", 100.00, 100.10, 99.90, 100.00),
+        ])
+        params = default_params()
+        signals, skipped = strategy.generate_signals(ohlcv, params)
+
+        assert len(skipped) == 1
+        assert skipped[0].reason == "FLAT_RANGE"
+        assert skipped[0].date == "2024-01-02"
+
+    def test_no_signal_bar_reported(self):
+        """When all bars are in the range and none after, reason is NO_SIGNAL_BAR."""
+        ohlcv = make_ohlcv([
+            ("2024-01-02T08:00:00Z", 100.00, 102.00, 98.00, 100.50),
+            ("2024-01-02T09:00:00Z", 100.50, 101.50, 99.00, 100.80),
+        ])
+        params = default_params()
+        signals, skipped = strategy.generate_signals(ohlcv, params)
+
+        assert len(skipped) == 1
+        assert skipped[0].reason == "NO_SIGNAL_BAR"
+        assert skipped[0].date == "2024-01-02"
+
+    def test_deadline_missed_reported(self):
+        """When the first bar after range_end is past the deadline,
+        reason is DEADLINE_MISSED."""
+        ohlcv = make_ohlcv([
+            ("2024-01-02T08:00:00Z", 100.00, 102.00, 98.00, 100.50),
+            ("2024-01-02T09:00:00Z", 100.50, 101.50, 99.00, 100.80),
+            ("2024-01-02T18:00:00Z", 100.80, 101.00, 100.50, 100.70),
+        ])
+        params = default_params(trigger_deadline=time(17, 0))
+        signals, skipped = strategy.generate_signals(ohlcv, params)
+
+        assert len(skipped) == 1
+        assert skipped[0].reason == "DEADLINE_MISSED"
+        assert skipped[0].date == "2024-01-02"
+
+    def test_no_skipped_days_on_valid_signal(self):
+        """When a valid signal is generated, no skipped day is reported."""
+        ohlcv = make_ohlcv([
+            ("2024-01-02T08:00:00Z", 100.00, 102.00, 98.00, 100.50),
+            ("2024-01-02T10:00:00Z", 100.50, 101.00, 100.20, 100.70),
+        ])
+        params = default_params()
+        signals, skipped = strategy.generate_signals(ohlcv, params)
+
+        assert len(skipped) == 0
+        assert pd.notna(signals.loc["2024-01-02T10:00:00Z", "long_entry"])
+
+    def test_empty_dataframe_no_skipped_days(self):
+        """Empty input DataFrame returns empty skipped list."""
+        ohlcv = make_ohlcv([])
+        params = default_params()
+        signals, skipped = strategy.generate_signals(ohlcv, params)
+
+        assert len(skipped) == 0
+        assert len(signals) == 0
+
+    def test_multi_day_mixed_skipped_and_valid(self):
+        """Multiple days: one valid, one skipped. Only skipped day is reported."""
+        ohlcv = make_ohlcv([
+            # Day 1: valid signal
+            ("2024-01-02T08:00:00Z", 100.00, 102.00, 98.00, 100.50),
+            ("2024-01-02T10:00:00Z", 100.50, 101.00, 100.20, 100.70),
+            # Day 2: flat range (all OHLC equal)
+            ("2024-01-03T08:00:00Z", 200.00, 200.00, 200.00, 200.00),
+            ("2024-01-03T10:00:00Z", 200.00, 200.10, 199.90, 200.00),
+        ])
+        params = default_params()
+        signals, skipped = strategy.generate_signals(ohlcv, params)
+
+        # Day 1 produces a signal, Day 2 is skipped with FLAT_RANGE
+        assert pd.notna(signals.loc["2024-01-02T10:00:00Z", "long_entry"])
+        assert len(skipped) == 1
+        assert skipped[0].date == "2024-01-03"
+        assert skipped[0].reason == "FLAT_RANGE"
+
+    def test_skipped_day_is_dataclass(self):
+        """SkippedDay instances are proper dataclasses."""
+        sd = SkippedDay(date="2024-01-02", reason="FLAT_RANGE")
+        assert sd.date == "2024-01-02"
+        assert sd.reason == "FLAT_RANGE"

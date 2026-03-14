@@ -28,6 +28,8 @@ class FetchRequest(BaseModel):
     date_from: date = Field(..., description="Start date (inclusive)")
     date_to: date = Field(..., description="End date (inclusive)")
     force_refresh: bool = Field(default=False, description="Skip cache and re-download")
+    hour_from: Optional[int] = Field(default=None, ge=0, le=23, description="First UTC hour to include (inclusive, Dukascopy only)")
+    hour_to: Optional[int] = Field(default=None, ge=0, le=23, description="Last UTC hour to include (inclusive, Dukascopy only)")
 
 
 class FetchResponse(BaseModel):
@@ -55,6 +57,13 @@ class ErrorResponse(BaseModel):
 
     error: str
     details: Optional[str] = None
+
+
+class SkippedDayOut(BaseModel):
+    """A trading day that was skipped during signal generation."""
+
+    date: str
+    reason: str
 
 
 class CacheEntry(BaseModel):

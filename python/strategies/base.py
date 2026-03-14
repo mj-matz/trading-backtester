@@ -28,7 +28,7 @@ class BaseStrategy(ABC):
         """
 
     @abstractmethod
-    def generate_signals(self, df: pd.DataFrame, params) -> pd.DataFrame:
+    def generate_signals(self, df: pd.DataFrame, params) -> tuple[pd.DataFrame, list]:
         """
         Generate trading signals from OHLCV data.
 
@@ -40,11 +40,12 @@ class BaseStrategy(ABC):
 
         Returns
         -------
-        pd.DataFrame
-            Same index as df. Columns:
+        tuple[pd.DataFrame, list]
+            - DataFrame: Same index as df. Columns:
                 long_entry, long_sl, long_tp,
                 short_entry, short_sl, short_tp,
                 signal_expiry
-            All float columns are NaN where no signal exists.
-            signal_expiry is NaT where no signal exists.
+              All float columns are NaN where no signal exists.
+              signal_expiry is NaT where no signal exists.
+            - list: Skipped days with reason codes (strategy-specific dataclass).
         """

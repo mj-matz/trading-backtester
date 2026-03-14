@@ -241,7 +241,7 @@ Bugs from the first QA pass on 2026-03-13 have been re-verified:
 - [x] AC-18: Pagination -- 50 trades per page with Previous/Next buttons and page counter
 - [x] AC-19: Charts interactive -- Hover tooltips show exact values; Brush component enables zoom/pan on time axis
 - [x] AC-20: "Save Run" button -- Placeholder with "Coming Soon" badge; disabled; wrapped in Tooltip explaining future availability
-- [ ] AC-21: Mobile responsive (375px) -- PARTIAL: see BUG-4 below
+- [x] AC-21: Mobile responsive (375px) -- FIXED: strategy params grid changed to `grid-cols-1 sm:grid-cols-2` (BUG-4)
 - [x] AC-22: No horizontal scrolling on desktop -- Two-column grid layout with `xl:grid-cols-[400px_1fr]`; trade table uses `overflow-x-auto` within its container
 - [x] AC-23: All shadcn/ui components used -- Button, Input, Select, Card, Table, Tabs, RadioGroup, Badge, Popover, Command, Tooltip, Alert, Form, Separator, Label all used
 
@@ -271,7 +271,7 @@ Bugs from the first QA pass on 2026-03-13 have been re-verified:
 
 #### BUG-4: Strategy parameter inputs cramped at 375px mobile
 - **Severity:** Low
-- **Status:** Open (carried from previous QA pass)
+- **Status:** FIXED (`/frontend`)
 - **Steps to Reproduce:**
   1. Open `/backtest` at 375px viewport width
   2. Look at the Strategy Parameters section (time inputs grid)
@@ -284,7 +284,7 @@ Bugs from the first QA pass on 2026-03-13 have been re-verified:
 
 #### BUG-7: Empty Authorization header sent by assets endpoint
 - **Severity:** Low
-- **Status:** Open (carried from previous QA pass, partially fixed)
+- **Status:** FIXED (`/backend`)
 - **Steps to Reproduce:**
   1. In a scenario where `session?.access_token` is falsy
   2. `GET /api/data/assets` sends `Authorization: ""`
@@ -297,7 +297,7 @@ Bugs from the first QA pass on 2026-03-13 have been re-verified:
 
 #### BUG-11: Client-side riskPercent minimum (0.1) differs from server-side minimum (0.01)
 - **Severity:** Low
-- **Status:** New
+- **Status:** FIXED (`/frontend`)
 - **Steps to Reproduce:**
   1. The spec says "risk % between 0.01 and 100"
   2. Client Zod schema in `backtest-types.ts` line 39: `.min(0.1, "Risk must be >= 0.1%")`
@@ -310,7 +310,7 @@ Bugs from the first QA pass on 2026-03-13 have been re-verified:
 
 #### BUG-12: `POST /api/backtest/run` (PROJ-2 endpoint) still uses in-memory rate limiter
 - **Severity:** Low
-- **Status:** New
+- **Status:** FIXED (`/backend`)
 - **Steps to Reproduce:**
   1. The main `POST /api/backtest` endpoint was upgraded to use Supabase RPC rate limiting (BUG-6 fix)
   2. However, `POST /api/backtest/run` (from PROJ-2) still imports and uses `checkRateLimit` from `src/lib/rate-limit.ts` (in-memory store)
@@ -352,24 +352,94 @@ Testing is code-review based (no live browser testing possible in this environme
 
 ### Summary
 
-- **Acceptance Criteria:** 22/23 passed (1 partial: mobile responsive at 375px)
+- **Acceptance Criteria:** 23/23 passed
 - **Edge Cases:** 4/4 passed
-- **Bugs Found:** 5 remaining (0 Critical, 0 High, 0 Medium, 5 Low)
-- **Previous Bugs Fixed:** 7/10 verified fixed (BUG-2, BUG-3, BUG-5, BUG-6, BUG-8, BUG-9, BUG-10)
-- **Security Audit:** PASS (no Critical or High security issues; 2 Low-severity findings noted)
+- **Bugs Found:** 1 remaining (0 Critical, 0 High, 0 Medium, 1 Low)
+- **Previous Bugs Fixed:** 11/12 verified fixed (BUG-2, BUG-3, BUG-4, BUG-5, BUG-6, BUG-7, BUG-8, BUG-9, BUG-10, BUG-11, BUG-12)
+- **Security Audit:** PASS (no Critical or High security issues)
 - **Production Ready:** YES
 
 ### Recommendation
 
-All Critical and Medium bugs from the previous QA pass have been fixed. The remaining 5 bugs are all Low severity and do not block deployment. Recommended action:
+All bugs resolved except BUG-1 (strategy params registry pattern — deferred to PROJ-6 by design). Feature is fully production-ready.
 
 1. **Deploy now** -- the feature is production-ready
-2. **Track remaining Low bugs** for the next sprint:
-   - BUG-4: Mobile cramped inputs (`/frontend`)
-   - BUG-7: Empty Authorization header in assets route (`/backend`)
-   - BUG-11: Client/server riskPercent min mismatch (`/frontend`)
-   - BUG-12: In-memory rate limiter on PROJ-2 endpoint (`/backend`)
+2. **Remaining open item:**
    - BUG-1: Strategy params registry pattern (`/frontend`, defer to PROJ-6)
+
+---
+
+## Open Bugs (Post-Deployment)
+
+### BUG-14 — CRITICAL: Date range not respected — backtest runs on all cached data
+
+- **File:** `python/main.py` — `/backtest` FastAPI endpoint (around line 777–815)
+- **Problem:** After loading `df` from cache or downloading fresh, the DataFrame is **never filtered to `[date_from, date_to]`**. If a previously cached file covers a larger date range (e.g., Dec 01–Dec 31), and the user requests Start: Dec 01, End: Dec 02, the full cached dataset is passed to `generate_signals` and `run_backtest`. Trades appear outside the requested date range.
+- **Evidence:** UI configured Start 01.12.2025 / End 02.12.2025, but trades appeared on Dec 02, 03, 04, 05.
+- **Root cause:** `find_cached_entry` can return a file that covers a superset of the requested range. There is no post-load date filter.
+- **Fix:** After setting the DatetimeIndex on `df` (line ~814), add a filter:
+  ```python
+  # Filter to requested date range (inclusive on both ends)
+  df = df[
+      (df.index.date >= date_from) & (df.index.date <= date_to)
+  ]
+  if df.empty:
+      raise HTTPException(
+          status_code=404,
+          detail=f"No data in range {date_from} to {date_to} (cached file may not cover this range — try force_refresh)",
+      )
+  ```
+- **Also fix `find_cached_entry`:** Currently it may match a cache entry whose stored `start_date`/`end_date` only partially overlaps the request. The lookup should only return a cache hit if `cached.start_date <= date_from AND cached.end_date >= date_to` (i.e., cache fully contains the requested range). Check `python/services/cache_service.py`.
+- **Status:** FIXED (`/backend`) — `python/main.py`: DataFrame gefiltert nach `[date_from, date_to]` nach DatetimeIndex-Normalisierung; 404 wenn kein Datum im Bereich. `find_cached_entry` war bereits korrekt (verwendet `.lte("date_from")` + `.gte("date_to")`).
+
+### BUG-15 — MEDIUM: Trade List does not show "No Trade" days
+
+- **Files:** `python/main.py` (response model), `src/components/backtest/trade-list.tsx` (or equivalent)
+- **Problem:** Every working day (Mon–Fri) where the strategy found no valid setup, or where no breakout occurred before the trigger deadline, is invisible in the Trade List. Users cannot tell how many days had no opportunity vs. how many they simply missed.
+- **Required behaviour:** Each working day in the backtest date range should appear in the Trade List. Days without a trade show a "No Trade" row with a reason:
+  - `No Range Bars` — no bars fell within the range window
+  - `Flat Range` — range high == range low
+  - `No Signal Bar` — no bar existed at or after range_end
+  - `Deadline Missed` — first bar after range_end was past trigger_deadline
+  - `Holiday` — no market data for this date at all
+- **Backend changes needed:**
+  1. PROJ-3 BUG-11 must be implemented first: `generate_signals` must return `list[SkippedDay]`
+  2. The `/backtest` response model gains a `skipped_days` field:
+     ```python
+     skipped_days: list[dict]  # [{date, reason}, ...]
+     ```
+  3. `main.py` builds this list from `SkippedDay` objects and includes it in the JSON response
+- **Frontend changes needed:**
+  1. The Trade List component receives `skipped_days` alongside `trades`
+  2. Merge both into a single chronological list for display
+  3. "No Trade" rows use a neutral style (no colour, no direction badge); reason shown in the "Exit Reason" column with a distinct badge (e.g. grey `NT` badge)
+  4. "No Trade" rows are excluded from all performance metrics and pagination count
+  5. A toggle ("Show no-trade days") allows hiding/showing them (default: shown)
+- **Status:** Open
+
+### BUG-13 — HIGH: Backtest API timeout hardcoded at 60 seconds — aborts long backtests
+
+- **File:** `src/app/api/backtest/route.ts` line 129
+- **Problem:** `AbortSignal.timeout(60_000)` kills the upstream FastAPI request after 60 seconds. A first-time fetch + backtest for a 1-month date range regularly exceeds this limit (data download alone can take 30–45s on cold cache). The user sees a timeout error and cannot run backtests longer than ~2–3 weeks.
+- **Current code:**
+  ```typescript
+  signal: AbortSignal.timeout(60_000),
+  ```
+- **Fix:** Increase to 300 seconds and configure the Next.js route for a longer Vercel function timeout:
+  ```typescript
+  // At the top of route.ts (outside the handler):
+  export const maxDuration = 300; // Vercel Pro: up to 300s; Hobby: max 60s
+
+  // In the fetch call:
+  signal: AbortSignal.timeout(300_000),
+  ```
+- **Note:** `maxDuration = 300` requires **Vercel Pro plan**. On Hobby plan the maximum is 60s and cannot be increased — the long-term solution in that case is to make the backtest async (job queue pattern). For now, upgrading to Pro is the recommended path.
+- **Also update** `src/hooks/use-backtest.ts`: the client-side timeout warning currently fires after 30s (`setTimeout` on line 54). Increase to 60s so users don't see a warning for normal runs:
+  ```typescript
+  timeoutTimerRef.current = setTimeout(() => {
+    setIsTimedOut(true);
+  }, 60_000); // was 30_000
+  ```
 
 ## Deployment
 

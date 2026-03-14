@@ -222,10 +222,94 @@ Data Fetcher System
 | BUG-17 | MEDIUM | Symbol field allowed path traversal characters used in Parquet file paths | **Fixed** |
 | BUG-18 | — | `python/services/.env` has real credentials on disk — expected for local dev, gitignored | Not a bug |
 | BUG-25 | MEDIUM | FastAPI bound to `0.0.0.0`, exposing unauthenticated service to entire LAN | **Fixed** |
+| BUG-26 | CRITICAL | `POINT_VALUES` in `dukascopy_fetcher.py` are wrong for XAUUSD and all indices — prices are 10x–100x too high | **Fixed** |
+| BUG-27 | HIGH | `fetch_dukascopy` downloads all 24 hours per day regardless of strategy time window — causes unnecessary slowness | **Open** |
+| BUG-28 | HIGH | Four symbols listed in `DUKASCOPY_SYMBOLS` return no data from Dukascopy — users see confusing errors and cannot backtest these assets | **Fixed** |
+
+### Bug Details
+
+#### BUG-26 — CRITICAL: Wrong `POINT_VALUES` for XAUUSD and all indices
+
+- **File:** `python/fetchers/dukascopy_fetcher.py` lines 64–85 (`POINT_VALUES` dict)
+- **Problem:** Dukascopy encodes these instruments with **3 decimal places** (divisor = 1000), but the current values are wrong:
+  - `"XAUUSD": 100` → prices displayed ~10× too high (e.g. ~41,867 instead of ~4,187)
+  - All indices `10` → prices displayed ~100× too high (e.g. GER40 ~2,365,300 instead of ~23,653)
+- **Evidence:**
+  - GER40 displayed entry `2,365,299.55` ÷ 100 = `23,653` — within TradingView candle 23,642–23,663 ✓
+  - XAUUSD displayed entry `41,866.82` ÷ 10 = `4,186.68` — within normal inter-broker spread of Pepperstone ~4,222 ✓
+- **Instruments not affected (leave unchanged):** Standard Forex (100000), JPY pairs (1000), XAGUSD (1000), Energy, Agricultural, Copper.
+- **Fix — update `POINT_VALUES` in `python/fetchers/dukascopy_fetcher.py`:**
+  ```python
+  # Metals
+  "XAUUSD": 1000,        # was 100 — empirically confirmed
+
+  # Indices
+  "DEUIDXEUR": 1000,     # was 10  — empirically confirmed (GER40)
+  "USA30IDXUSD": 1000,   # was 10  — same encoding as DEUIDXEUR
+  "USA500IDXUSD": 1000,  # was 10
+  "USATECHIDXUSD": 1000, # was 10
+  "GBRIDXGBP": 1000,     # was 10
+  "FRAIDXEUR": 1000,     # was 10
+  "JPNIDXJPY": 1000,     # was 10
+  "AUSIDXAUD": 1000,     # was 10
+  ```
+- **Note on residual price difference:** After the fix, Dukascopy prices will be ~0.5–1% different from Pepperstone prices — normal inter-broker variation, not correctable via Commission/Slippage. Does not materially affect strategy metrics (win rate, R-multiples, drawdown).
+- **After fix — mandatory cache invalidation:** Delete ALL existing Parquet cache files and Supabase `data_cache` rows for XAUUSD and all index instruments. They contain wrong prices and must be re-fetched. Forex, XAGUSD, and Energy cache files are unaffected.
+
+#### BUG-27 — HIGH: `fetch_dukascopy` downloads unnecessary hours
+
+- **File:** `python/fetchers/dukascopy_fetcher.py` lines 182–189 (hours generation loop)
+- **Problem:** For every trading day the fetcher generates hours `0–23` (24 files/day). For a typical strategy with range `08:00–09:00` CET and exit `16:30` CET, only UTC hours `07:00–15:00` are needed (~9 files/day). The remaining 15 hours/day are downloaded, stored in RAM, and discarded after resampling.
+  - 1 month: 528 downloads instead of ~198 (62% wasted)
+  - 1 year: 6,048 downloads instead of ~2,268 (62% wasted)
+  - A 5-day backtest that should complete in ~5s takes 15–20s; a 1-month backtest exceeds the 60s API timeout on first fetch.
+- **Fix:** Add `hour_from: int = 0` and `hour_to: int = 23` (UTC, inclusive) parameters to `fetch_dukascopy`. Filter the hours list:
+  ```python
+  if cur.weekday() < 5 and hour_from <= cur.hour <= hour_to:
+      hours.append(cur)
+  ```
+- **Cache key update:** The Parquet filename and `data_cache` lookup must include `hour_from`/`hour_to` so that a cached file for hours `07–15` is not reused for a different time window.  Suggested filename change: `{source}/{symbol}/{timeframe}/{start}_{end}_h{hour_from:02d}-{hour_to:02d}.parquet`
+- **Caller update:** The FastAPI `/backtest` orchestration endpoint (`python/main.py`) must derive `hour_from`/`hour_to` from the strategy's `range_start` and `time_exit` parameters (converted to UTC), then pass them to `fetch_dukascopy`. Add a small buffer (e.g. ±1 hour) to account for DST transitions.
+- **Suggested helper in `main.py`:**
+  ```python
+  def _strategy_hour_range(range_start: time, time_exit: time, tz: str) -> tuple[int, int]:
+      """Return (hour_from_utc, hour_to_utc) with ±1h buffer."""
+      zone = ZoneInfo(tz)
+      # convert local times to UTC offsets (simplified — use a reference date)
+      ref = date(2000, 1, 15)  # arbitrary non-DST date for offset estimation
+      start_utc = datetime.combine(ref, range_start, tzinfo=zone).astimezone(timezone.utc).hour
+      exit_utc  = datetime.combine(ref, time_exit,   tzinfo=zone).astimezone(timezone.utc).hour
+      return max(0, start_utc - 1), min(23, exit_utc + 1)
+  ```
+
+#### BUG-28 — HIGH: Several symbols in `DUKASCOPY_SYMBOLS` return no data from Dukascopy
+
+- **File:** `python/fetchers/dukascopy_fetcher.py` — `DUKASCOPY_SYMBOLS` dict
+- **Problem:** The following symbols are listed in `DUKASCOPY_SYMBOLS` (and therefore appear in the asset selector UI), but Dukascopy's public datafeed returns no `.bi5` files for them. Users see a generic "No data returned" error and cannot backtest these instruments.
+- **Confirmed affected symbols (tested Dec 08–10, 2025):**
+
+  | User symbol | Dukascopy ticker | Error |
+  |-------------|-----------------|-------|
+  | `NATGASUSD` | `NATGASCMDUSD` | No data returned |
+  | `CORNUSD` | `CORNCMDUSX` | No data returned |
+  | `XPDUSD` | `XPDUSD` | No data returned |
+  | `XPTUSD` | `XPTUSD` | No data returned |
+
+- **Likely causes (investigate per symbol):**
+  - Dukascopy has discontinued or never offered this instrument on the public datafeed
+  - The Dukascopy ticker is wrong (e.g., `NATGASCMDUSD` may have a different internal name on the datafeed)
+  - The instrument requires a different URL path structure than `datafeed.dukascopy.com/datafeed/{SYMBOL}/...`
+- **Fix options (evaluate per symbol):**
+  1. **Verify correct ticker:** Check `https://datafeed.dukascopy.com/datafeed/{TICKER}/2024/00/02/00h_ticks.bi5` manually for candidate tickers
+  2. **Remove if unsupported:** If no valid Dukascopy ticker exists, remove the symbol from `DUKASCOPY_SYMBOLS` and from the FastAPI `/assets` response so it never appears in the UI
+  3. **Mark as unavailable:** Alternatively, keep the symbol but tag it with `"source": null` or `"available": false` so the UI can grey it out with a tooltip "Not available via Dukascopy"
+- **Short-term fix (until root cause verified):** Remove all four symbols from `DUKASCOPY_SYMBOLS` to prevent user confusion. They can be re-added once the correct tickers are confirmed.
+- **Impact:** Users waste time configuring backtests that always fail. The error message ("The symbol may be unsupported or the date range may have no trading data") is not specific enough to communicate that the symbol itself is the problem.
+- **Status:** Open
 
 ### Production Readiness
 
-All critical and high severity bugs resolved. Remaining open items (BUG-6, BUG-15) are low severity and do not block deployment.
+~~All critical and high severity bugs resolved.~~ **BUG-27 (HIGH) is open — affects download speed for large date ranges.** Remaining low-severity open items: BUG-6, BUG-15.
 
 ## Deployment
 

@@ -372,6 +372,34 @@ This is a pure Python backend feature with no new API routes, no new database ta
 - **Fix:** Change `except ZoneInfoNotFoundError:` to `except (ZoneInfoNotFoundError, KeyError):` at line 322.
 - **Status:** Open (nice to have)
 
+### New Bugs Found (Post-Deployment)
+
+#### BUG-11 — MEDIUM: `generate_signals` does not report skipped trading days
+
+- **File:** `python/strategies/breakout.py` — `generate_signals` method
+- **Problem:** Days where no trade signal is generated are silently skipped. The caller (and ultimately the UI) has no way to know *why* a day produced no trade — whether it was a missing range, flat range, trigger deadline missed, or simply no market data (holiday/weekend).
+- **User impact:** The Trade List in the UI shows only actual trades. Working days where conditions were not met (e.g. price never broke out before trigger deadline) are invisible. The user cannot distinguish a "no breakout" day from a holiday.
+- **Required output:** `generate_signals` should additionally return a list of skipped days with a reason code per day:
+  - `NO_BARS` — no OHLCV bars exist for this calendar date at all (holiday / data gap)
+  - `NO_RANGE_BARS` — bars exist but none fall within `[range_start, range_end)` window
+  - `FLAT_RANGE` — range high equals range low (no directional bias)
+  - `NO_SIGNAL_BAR` — no bar exists at or after `range_end` on this day
+  - `DEADLINE_MISSED` — first bar after `range_end` is already past `trigger_deadline`
+- **Suggested return type change:** Instead of returning only `signals_df`, return a tuple:
+  ```python
+  def generate_signals(
+      self, df: pd.DataFrame, params: BreakoutParams
+  ) -> tuple[pd.DataFrame, list[SkippedDay]]:
+      ...
+
+  @dataclass
+  class SkippedDay:
+      date: date
+      reason: str   # one of the reason codes above
+  ```
+- **Backward compatibility:** The caller in `main.py` must be updated to unpack the tuple. The existing `signals_df` usage is unchanged.
+- **Status:** Open
+
 ### Security Audit Highlights
 
 No vulnerabilities found. Key security controls verified:
@@ -389,6 +417,15 @@ No vulnerabilities found. Key security controls verified:
 - **Security:** Pass
 - **Regression:** Pass (PROJ-1, PROJ-2, PROJ-8 unaffected)
 - **Production Ready:** YES
+
+#### BUG-12: `validate_params` accepts absurdly long overnight ranges (e.g. 10:00–08:00 = 22h) — LOW
+
+- **File:** `python/strategies/breakout.py` — `validate_params` method
+- **Severity:** Low
+- **Root cause:** After the BUG-6 fix (allow overnight ranges like 22:00–02:00), the check `range_end < range_start` was removed entirely. This caused `range_start=10:00, range_end=08:00` (a 22-hour window) to be silently accepted, and the test `test_validate_params_invalid_range` to fail.
+- **Fix:** Calculate the effective range duration in minutes (handling the midnight wrap for overnight ranges). Raise `ValueError` if duration exceeds 12 hours (`MAX_RANGE_MINUTES = 720`). Valid overnight range 22:00–02:00 = 4h passes; invalid 10:00–08:00 = 22h is rejected.
+- **Tests added:** `test_validate_params_valid_overnight_range` (22:00–02:00 must not raise), existing `test_validate_params_invalid_range` now passes again.
+- **Status:** Fixed (2026-03-14)
 
 ---
 

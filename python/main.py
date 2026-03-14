@@ -17,7 +17,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
-from models import FetchRequest, FetchResponse, ErrorResponse
+from models import FetchRequest, FetchResponse, ErrorResponse, SkippedDayOut
 from fetchers.dukascopy_fetcher import fetch_dukascopy
 from fetchers.yfinance_fetcher import fetch_yfinance, VALID_INTERVALS as YFINANCE_INTERVALS
 from services.auth import verify_jwt
@@ -153,8 +153,11 @@ async def fetch_data(
     # Fetch from source
     try:
         if source == "dukascopy":
-            # Always fetch 1m data first, then resample if needed
-            base_df = fetch_dukascopy(symbol, date_from, date_to)
+            # Always fetch 1m data first, then resample if needed.
+            # Optional hour_from/hour_to narrow the download to specific UTC hours (BUG-27).
+            h_from = request.hour_from if request.hour_from is not None else 0
+            h_to = request.hour_to if request.hour_to is not None else 23
+            base_df = fetch_dukascopy(symbol, date_from, date_to, hour_from=h_from, hour_to=h_to)
             if timeframe != "1m":
                 df = resample_ohlcv(base_df, timeframe)
             else:
@@ -723,6 +726,7 @@ class BacktestOrchestrationResponse(BaseModel):
     equity_curve: List[EquityCurveOut]
     drawdown_curve: List[DrawdownCurveOut]
     trades: List[TradeDetailOut]
+    skipped_days: List[SkippedDayOut] = []
 
 
 # ── /backtest orchestration endpoint ─────────────────────────────────────────
@@ -773,6 +777,13 @@ async def backtest_orchestrate(
     _validate_timeframe("dukascopy", request.timeframe)
 
     # ── 4. Fetch / load cached data ───────────────────────────────────────────
+    # Derive the UTC hour range from the strategy config (BUG-27).
+    # Add ±1h buffer around the trading window to handle DST transitions.
+    _range_start_h = int(request.rangeStart.split(":")[0])
+    _time_exit_h = int(request.timeExit.split(":")[0])
+    hour_from = max(0, _range_start_h - 1)
+    hour_to = min(23, _time_exit_h + 1)
+
     df = None
     cached = find_cached_entry(symbol, "dukascopy", request.timeframe, date_from, date_to)
     if cached:
@@ -784,7 +795,8 @@ async def backtest_orchestrate(
 
     if df is None:
         try:
-            base_df = fetch_dukascopy(symbol, date_from, date_to)
+            # On cache miss: download only the required hours to save time (BUG-27).
+            base_df = fetch_dukascopy(symbol, date_from, date_to, hour_from=hour_from, hour_to=hour_to)
             df = resample_ohlcv(base_df, request.timeframe) if request.timeframe != "1m" else base_df
         except TimeoutError as e:
             raise HTTPException(status_code=504, detail=str(e))
@@ -821,6 +833,28 @@ async def backtest_orchestrate(
             detail=f"Data is missing required columns: {required_cols - set(df.columns)}",
         )
 
+    # ── 4b. Filter to requested date range (BUG-14 fix) ─────────────────────
+    # Cached data may cover a wider range than requested. Trim to [date_from, date_to].
+    df = df[
+        (df.index.date >= date_from) & (df.index.date <= date_to)
+    ]
+    if df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No data in range {date_from} to {date_to} (cached file may not cover this range — try force_refresh)",
+        )
+
+    # ── 4c. Filter to relevant UTC hours (BUG-27 fix) ────────────────────────
+    # Keep only bars within [hour_from, hour_to]. This covers both the range-
+    # formation window (rangeStart..rangeEnd) and the trade window (..timeExit),
+    # with a ±1h DST buffer applied when hour_from/hour_to were derived above.
+    df = df[df.index.hour.between(hour_from, hour_to)]
+    if df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No data in UTC hour range {hour_from:02d}:00-{hour_to:02d}:00 for {symbol} ({date_from} to {date_to})",
+        )
+
     # ── 5. Generate breakout signals ──────────────────────────────────────────
     breakout_params = BreakoutParams(
         asset=symbol,
@@ -836,7 +870,7 @@ async def backtest_orchestrate(
 
     strategy = BreakoutStrategy()
     try:
-        signals_df = strategy.generate_signals(df, breakout_params)
+        signals_df, skipped_days = strategy.generate_signals(df, breakout_params)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -943,11 +977,17 @@ async def backtest_orchestrate(
             duration_minutes=duration_minutes,
         ))
 
+    skipped_days_out = [
+        SkippedDayOut(date=sd.date, reason=sd.reason)
+        for sd in skipped_days
+    ]
+
     return BacktestOrchestrationResponse(
         metrics=metrics_out,
         equity_curve=equity_curve_out,
         drawdown_curve=drawdown_curve_out,
         trades=trades_out,
+        skipped_days=skipped_days_out,
     )
 
 

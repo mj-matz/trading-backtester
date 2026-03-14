@@ -45,16 +45,11 @@ DUKASCOPY_SYMBOLS: dict[str, str] = {
     # Precious Metals
     "XAUUSD": "XAUUSD", "GOLD": "XAUUSD",
     "XAGUSD": "XAGUSD", "SILVER": "XAGUSD",
-    "XPTUSD": "XPTUSD", "PLATINUM": "XPTUSD",
-    "XPDUSD": "XPDUSD", "PALLADIUM": "XPDUSD",
     # Energy
     "WTIUSD": "LIGHTCMDUSD", "CRUDEOIL": "LIGHTCMDUSD", "WTI": "LIGHTCMDUSD",
     "BRENTUSD": "BRENTCMDUSD", "BRENT": "BRENTCMDUSD",
-    "NATGASUSD": "NATGASCMDUSD", "NATGAS": "NATGASCMDUSD",
     # Agricultural
-    "CORNUSD": "CORNCMDUSX", "CORN": "CORNCMDUSX",
     "SOYBEANUSD": "SOYBEANCMDUSX", "SOYBEAN": "SOYBEANCMDUSX",
-    "WHEATUSD": "WHEATCMDUSX", "WHEAT": "WHEATCMDUSX",
     # Industrial Metals
     "COPPERUSD": "COPPERCMDUSD", "COPPER": "COPPERCMDUSD",
 }
@@ -70,16 +65,16 @@ POINT_VALUES: dict[str, int] = {
     # JPY pairs — 3 decimal places (e.g. 150.123 → raw 150123 / 1000)
     "USDJPY": 1000, "EURJPY": 1000, "GBPJPY": 1000,
     "AUDJPY": 1000, "CADJPY": 1000, "CHFJPY": 1000, "NZDJPY": 1000,
-    # Metals — 2 decimal places (e.g. XAUUSD 2300.12 → raw 230012 / 100)
-    "XAUUSD": 100, "XAGUSD": 1000, "XPTUSD": 100, "XPDUSD": 100,
+    # Metals — 3 decimal places (e.g. XAUUSD 2300.123 → raw 2300123 / 1000)
+    "XAUUSD": 1000, "XAGUSD": 1000,
     # Energy — 3 decimal places
-    "LIGHTCMDUSD": 1000, "BRENTCMDUSD": 1000, "NATGASCMDUSD": 10000,
-    # Indices — 1 decimal place (e.g. DAX 18000.1 → raw 180001 / 10)
-    "DEUIDXEUR": 10, "USA30IDXUSD": 10, "USA500IDXUSD": 10,
-    "USATECHIDXUSD": 10, "GBRIDXGBP": 10, "FRAIDXEUR": 10,
-    "JPNIDXJPY": 10, "AUSIDXAUD": 10,
+    "LIGHTCMDUSD": 1000, "BRENTCMDUSD": 1000,
+    # Indices — 3 decimal places (e.g. DAX 23653.000 → raw 23653000 / 1000)
+    "DEUIDXEUR": 1000, "USA30IDXUSD": 1000, "USA500IDXUSD": 1000,
+    "USATECHIDXUSD": 1000, "GBRIDXGBP": 1000, "FRAIDXEUR": 1000,
+    "JPNIDXJPY": 1000, "AUSIDXAUD": 1000,
     # Agricultural
-    "CORNCMDUSX": 10000, "SOYBEANCMDUSX": 10000, "WHEATCMDUSX": 10000,
+    "SOYBEANCMDUSX": 10000,
     # Industrial
     "COPPERCMDUSD": 100000,
 }
@@ -158,6 +153,8 @@ def fetch_dukascopy(
     symbol: str,
     date_from: date,
     date_to: date,
+    hour_from: int = 0,
+    hour_to: int = 23,
 ) -> pd.DataFrame:
     """
     Fetch tick data from Dukascopy and return a 1-minute OHLCV DataFrame.
@@ -166,6 +163,8 @@ def fetch_dukascopy(
         symbol:    Instrument symbol (e.g. "XAUUSD", "EURUSD", "GER40")
         date_from: Start date (inclusive)
         date_to:   End date (inclusive)
+        hour_from: First UTC hour to download, 0-23 inclusive (default 0)
+        hour_to:   Last UTC hour to download, 0-23 inclusive (default 23)
 
     Returns:
         DataFrame with columns: datetime (UTC), open, high, low, close, volume
@@ -174,25 +173,30 @@ def fetch_dukascopy(
         ValueError: No data found or symbol unsupported.
         TimeoutError: Download exceeded FETCH_TIMEOUT_SECONDS.
     """
+    if not (0 <= hour_from <= 23 and 0 <= hour_to <= 23 and hour_from <= hour_to):
+        raise ValueError(f"Invalid hour range: hour_from={hour_from}, hour_to={hour_to} (must be 0-23, from <= to)")
+
     duka_symbol = resolve_symbol(symbol)
     point = POINT_VALUES.get(duka_symbol, 100000)
 
     # Generate all hours in [date_from, date_to] inclusive, skipping weekends
-    # (Dukascopy has no weekend data for Forex/metals/indices)
+    # and optionally restricting to [hour_from, hour_to] (BUG-27).
     start = datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
     end = datetime(date_to.year, date_to.month, date_to.day, 23, tzinfo=timezone.utc)
     hours = []
     cur = start
     while cur <= end:
-        if cur.weekday() < 5:  # 0=Mon … 4=Fri, skip Sat/Sun
+        if cur.weekday() < 5 and hour_from <= cur.hour <= hour_to:  # 0=Mon … 4=Fri
             hours.append(cur)
         cur += timedelta(hours=1)
 
+    hour_range_str = "all hours" if (hour_from == 0 and hour_to == 23) else f"h{hour_from:02d}-h{hour_to:02d} UTC"
     logger.info(
-        "Downloading %d hours of %s (%s) from Dukascopy",
+        "Downloading %d hours of %s (%s) from Dukascopy [%s]",
         len(hours),
         symbol,
         duka_symbol,
+        hour_range_str,
     )
 
     frames: list[pd.DataFrame] = []
