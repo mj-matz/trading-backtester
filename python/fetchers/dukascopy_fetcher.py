@@ -1,100 +1,157 @@
-"""Dukascopy data fetcher using the duka library.
+"""Direct Dukascopy data fetcher — replaces the broken duka==0.2.0 library.
 
-Fetches tick data from Dukascopy and converts it to OHLCV DataFrames.
-Supports intraday timeframes: 1m (tick), 5m, 15m, 1h, 4h, 1d.
+Downloads .bi5 tick data directly from Dukascopy's public datafeed API:
+  https://datafeed.dukascopy.com/datafeed/{SYMBOL}/{YEAR}/{MONTH-1:02d}/{DAY:02d}/{HOUR:02d}h_ticks.bi5
+
+Each .bi5 file is LZMA-compressed binary data. Each tick is 20 bytes:
+  - uint32 big-endian: milliseconds from start of the hour
+  - uint32 big-endian: ask price (raw integer, divide by POINT_VALUE)
+  - uint32 big-endian: bid price (raw integer, divide by POINT_VALUE)
+  - float32 big-endian: ask volume
+  - float32 big-endian: bid volume
 """
 
+import lzma
+import struct
 import logging
-import tempfile
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from datetime import date, datetime, timezone
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta, timezone
+from typing import Optional
 
+import httpx
 import pandas as pd
 
 from config import FETCH_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 
-# Mapping of common symbol names to duka-compatible tickers
-# Includes Forex majors, indices, commodities, and metals
-DUKASCOPY_SYMBOLS = {
+# ── Symbol mapping ────────────────────────────────────────────────────────────
+
+DUKASCOPY_SYMBOLS: dict[str, str] = {
     # Forex Majors
-    "EURUSD": "EURUSD",
-    "GBPUSD": "GBPUSD",
-    "USDCHF": "USDCHF",
-    "USDJPY": "USDJPY",
-    "AUDUSD": "AUDUSD",
-    "NZDUSD": "NZDUSD",
-    "USDCAD": "USDCAD",
+    "EURUSD": "EURUSD", "GBPUSD": "GBPUSD", "USDCHF": "USDCHF",
+    "USDJPY": "USDJPY", "AUDUSD": "AUDUSD", "NZDUSD": "NZDUSD", "USDCAD": "USDCAD",
     # Forex Crosses
-    "EURGBP": "EURGBP",
-    "EURJPY": "EURJPY",
-    "GBPJPY": "GBPJPY",
-    "EURAUD": "EURAUD",
-    "EURCHF": "EURCHF",
-    "GBPCHF": "GBPCHF",
-    "AUDCAD": "AUDCAD",
-    "AUDJPY": "AUDJPY",
-    "CADJPY": "CADJPY",
-    "CHFJPY": "CHFJPY",
-    "NZDJPY": "NZDJPY",
+    "EURGBP": "EURGBP", "EURJPY": "EURJPY", "GBPJPY": "GBPJPY",
+    "EURAUD": "EURAUD", "EURCHF": "EURCHF", "GBPCHF": "GBPCHF",
+    "AUDCAD": "AUDCAD", "AUDJPY": "AUDJPY", "CADJPY": "CADJPY",
+    "CHFJPY": "CHFJPY", "NZDJPY": "NZDJPY",
     # Indices
-    "GER30": "DEUIDXEUR",
-    "GER40": "DEUIDXEUR",
-    "DAX": "DEUIDXEUR",
-    "US30": "USA30IDXUSD",
-    "US500": "USA500IDXUSD",
-    "SPX500": "USA500IDXUSD",
-    "NAS100": "USATECHIDXUSD",
-    "USTEC": "USATECHIDXUSD",
-    "UK100": "GBRIDXGBP",
-    "FTSE100": "GBRIDXGBP",
-    "FRA40": "FRAIDXEUR",
-    "JPN225": "JPNIDXJPY",
-    "AUS200": "AUSIDXAUD",
+    "GER30": "DEUIDXEUR", "GER40": "DEUIDXEUR", "DAX": "DEUIDXEUR",
+    "US30": "USA30IDXUSD", "US500": "USA500IDXUSD", "SPX500": "USA500IDXUSD",
+    "NAS100": "USATECHIDXUSD", "USTEC": "USATECHIDXUSD",
+    "UK100": "GBRIDXGBP", "FTSE100": "GBRIDXGBP",
+    "FRA40": "FRAIDXEUR", "JPN225": "JPNIDXJPY", "AUS200": "AUSIDXAUD",
     # Precious Metals
-    "XAUUSD": "XAUUSD",
-    "GOLD": "XAUUSD",
-    "XAGUSD": "XAGUSD",
-    "SILVER": "XAGUSD",
-    "XPTUSD": "XPTUSD",
-    "PLATINUM": "XPTUSD",
-    "XPDUSD": "XPDUSD",
-    "PALLADIUM": "XPDUSD",
-    # Commodities — Energy
-    "WTIUSD": "LIGHTCMDUSD",
-    "CRUDEOIL": "LIGHTCMDUSD",
-    "WTI": "LIGHTCMDUSD",
-    "BRENTUSD": "BRENTCMDUSD",
-    "BRENT": "BRENTCMDUSD",
-    "NATGASUSD": "NATGASCMDUSD",
-    "NATGAS": "NATGASCMDUSD",
-    # Commodities — Agricultural
-    "CORNUSD": "CORNCMDUSX",
-    "CORN": "CORNCMDUSX",
-    "SOYBEANUSD": "SOYBEANCMDUSX",
-    "SOYBEAN": "SOYBEANCMDUSX",
-    "WHEATUSD": "WHEATCMDUSX",
-    "WHEAT": "WHEATCMDUSX",
+    "XAUUSD": "XAUUSD", "GOLD": "XAUUSD",
+    "XAGUSD": "XAGUSD", "SILVER": "XAGUSD",
+    "XPTUSD": "XPTUSD", "PLATINUM": "XPTUSD",
+    "XPDUSD": "XPDUSD", "PALLADIUM": "XPDUSD",
+    # Energy
+    "WTIUSD": "LIGHTCMDUSD", "CRUDEOIL": "LIGHTCMDUSD", "WTI": "LIGHTCMDUSD",
+    "BRENTUSD": "BRENTCMDUSD", "BRENT": "BRENTCMDUSD",
+    "NATGASUSD": "NATGASCMDUSD", "NATGAS": "NATGASCMDUSD",
+    # Agricultural
+    "CORNUSD": "CORNCMDUSX", "CORN": "CORNCMDUSX",
+    "SOYBEANUSD": "SOYBEANCMDUSX", "SOYBEAN": "SOYBEANCMDUSX",
+    "WHEATUSD": "WHEATCMDUSX", "WHEAT": "WHEATCMDUSX",
     # Industrial Metals
-    "COPPERUSD": "COPPERCMDUSD",
-    "COPPER": "COPPERCMDUSD",
+    "COPPERUSD": "COPPERCMDUSD", "COPPER": "COPPERCMDUSD",
 }
+
+# Raw price divisor: actual_price = raw_integer / POINT_VALUE[duka_symbol]
+# Determined by the number of decimal places Dukascopy encodes for each instrument.
+POINT_VALUES: dict[str, int] = {
+    # Standard Forex — 5 decimal places (e.g. 1.08234 → raw 108234 / 100000)
+    "EURUSD": 100000, "GBPUSD": 100000, "USDCHF": 100000,
+    "AUDUSD": 100000, "NZDUSD": 100000, "USDCAD": 100000,
+    "EURGBP": 100000, "EURAUD": 100000, "EURCHF": 100000,
+    "GBPCHF": 100000, "AUDCAD": 100000,
+    # JPY pairs — 3 decimal places (e.g. 150.123 → raw 150123 / 1000)
+    "USDJPY": 1000, "EURJPY": 1000, "GBPJPY": 1000,
+    "AUDJPY": 1000, "CADJPY": 1000, "CHFJPY": 1000, "NZDJPY": 1000,
+    # Metals — 2 decimal places (e.g. XAUUSD 2300.12 → raw 230012 / 100)
+    "XAUUSD": 100, "XAGUSD": 1000, "XPTUSD": 100, "XPDUSD": 100,
+    # Energy — 3 decimal places
+    "LIGHTCMDUSD": 1000, "BRENTCMDUSD": 1000, "NATGASCMDUSD": 10000,
+    # Indices — 1 decimal place (e.g. DAX 18000.1 → raw 180001 / 10)
+    "DEUIDXEUR": 10, "USA30IDXUSD": 10, "USA500IDXUSD": 10,
+    "USATECHIDXUSD": 10, "GBRIDXGBP": 10, "FRAIDXEUR": 10,
+    "JPNIDXJPY": 10, "AUSIDXAUD": 10,
+    # Agricultural
+    "CORNCMDUSX": 10000, "SOYBEANCMDUSX": 10000, "WHEATCMDUSX": 10000,
+    # Industrial
+    "COPPERCMDUSD": 100000,
+}
+
+_BASE_URL = "https://datafeed.dukascopy.com/datafeed"
+
+# Binary format per tick: ms_uint32, ask_uint32, bid_uint32, ask_float32, bid_float32
+_TICK_FMT = ">IIIff"
+_TICK_SIZE = struct.calcsize(_TICK_FMT)  # 20 bytes
 
 
 def resolve_symbol(symbol: str) -> str:
-    """Resolve a user-friendly symbol name to a Dukascopy ticker."""
-    upper = symbol.upper()
-    if upper in DUKASCOPY_SYMBOLS:
-        return DUKASCOPY_SYMBOLS[upper]
-    # If not in our mapping, try the symbol as-is
-    return upper
+    """Resolve a user-friendly symbol to a Dukascopy ticker."""
+    return DUKASCOPY_SYMBOLS.get(symbol.upper(), symbol.upper())
 
 
 def get_supported_symbols() -> dict[str, str]:
-    """Return the full mapping of supported symbol aliases."""
     return dict(DUKASCOPY_SYMBOLS)
+
+
+def _hour_url(duka_symbol: str, dt: datetime) -> str:
+    """Build the .bi5 download URL for one hour. Month is 0-indexed in Dukascopy URLs."""
+    return (
+        f"{_BASE_URL}/{duka_symbol}/"
+        f"{dt.year}/{dt.month - 1:02d}/{dt.day:02d}/"
+        f"{dt.hour:02d}h_ticks.bi5"
+    )
+
+
+def _download_hour(
+    duka_symbol: str,
+    dt: datetime,
+    point: int,
+    client: httpx.Client,
+) -> Optional[pd.DataFrame]:
+    """Download and decode one hour of tick data. Returns None when no data."""
+    url = _hour_url(duka_symbol, dt)
+    try:
+        resp = client.get(url, timeout=20)
+        if resp.status_code == 404 or len(resp.content) == 0:
+            return None  # Normal: weekend / holiday / no trading that hour
+        if resp.status_code != 200:
+            logger.debug("HTTP %d for %s", resp.status_code, url)
+            return None
+
+        raw = lzma.decompress(resp.content)
+        n = len(raw) // _TICK_SIZE
+        if n == 0:
+            return None
+
+        hour_ms = int(dt.timestamp() * 1000)
+        rows = []
+        for i in range(n):
+            ms, ask_raw, bid_raw, ask_vol, bid_vol = struct.unpack_from(
+                _TICK_FMT, raw, i * _TICK_SIZE
+            )
+            rows.append(
+                {
+                    "datetime": pd.Timestamp(hour_ms + ms, unit="ms", tz="UTC"),
+                    "ask": ask_raw / point,
+                    "bid": bid_raw / point,
+                    "ask_volume": float(ask_vol),
+                    "bid_volume": float(bid_vol),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    except lzma.LZMAError:
+        return None  # Corrupt or truncated file — skip
+    except Exception as exc:
+        logger.debug("Error for %s: %s", url, exc)
+        return None
 
 
 def fetch_dukascopy(
@@ -105,117 +162,76 @@ def fetch_dukascopy(
     """
     Fetch tick data from Dukascopy and return a 1-minute OHLCV DataFrame.
 
-    The duka library downloads tick data which we then resample to 1-minute bars
-    as the base resolution. Higher timeframes are created by the resampler service.
-
     Args:
-        symbol: Instrument symbol (e.g., "XAUUSD", "GER40", "EURUSD", "BRENT")
+        symbol:    Instrument symbol (e.g. "XAUUSD", "EURUSD", "GER40")
         date_from: Start date (inclusive)
-        date_to: End date (inclusive)
+        date_to:   End date (inclusive)
 
     Returns:
-        pandas DataFrame with columns: datetime, open, high, low, close, volume
-        datetime is timezone-aware UTC.
+        DataFrame with columns: datetime (UTC), open, high, low, close, volume
 
     Raises:
-        ValueError: If the symbol is not supported or no data is returned.
+        ValueError: No data found or symbol unsupported.
+        TimeoutError: Download exceeded FETCH_TIMEOUT_SECONDS.
     """
-    from duka.app import app as duka_app
-    from duka.core.utils import TimeFrame
-
     duka_symbol = resolve_symbol(symbol)
-    start_dt = datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
-    end_dt = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59, tzinfo=timezone.utc)
+    point = POINT_VALUES.get(duka_symbol, 100000)
 
-    logger.info(f"Fetching Dukascopy data: {duka_symbol} from {date_from} to {date_to}")
+    # Generate all hours in [date_from, date_to] inclusive
+    start = datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
+    end = datetime(date_to.year, date_to.month, date_to.day, 23, tzinfo=timezone.utc)
+    hours = []
+    cur = start
+    while cur <= end:
+        hours.append(cur)
+        cur += timedelta(hours=1)
 
-    # duka writes CSV files to a directory. We use a temp directory.
-    with tempfile.TemporaryDirectory() as tmpdir:
-        try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    duka_app,
-                    duka_symbol,
-                    start_dt,
-                    end_dt,
-                    1,  # threads
-                    TimeFrame.TICK,
-                    tmpdir,
-                    True,  # header
-                )
-                future.result(timeout=FETCH_TIMEOUT_SECONDS)
-        except FuturesTimeoutError:
-            raise TimeoutError(
-                f"Fetch timed out after {FETCH_TIMEOUT_SECONDS} seconds"
-            )
-        except TimeoutError:
-            raise
-        except Exception as e:
-            raise ValueError(f"Failed to fetch data from Dukascopy for {duka_symbol}: {e}")
+    logger.info(
+        "Downloading %d hours of %s (%s) from Dukascopy",
+        len(hours),
+        symbol,
+        duka_symbol,
+    )
 
-        # Find the generated CSV file
-        csv_files = list(Path(tmpdir).glob("*.csv"))
-        if not csv_files:
-            raise ValueError(
-                f"No data returned from Dukascopy for {symbol} ({duka_symbol}) "
-                f"between {date_from} and {date_to}. "
-                f"The symbol may be unsupported or the date range may have no trading data."
-            )
+    frames: list[pd.DataFrame] = []
+    with httpx.Client(follow_redirects=True) as client:
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            future_map = {
+                executor.submit(_download_hour, duka_symbol, h, point, client): h
+                for h in hours
+            }
+            for future in as_completed(future_map, timeout=FETCH_TIMEOUT_SECONDS):
+                result = future.result()
+                if result is not None:
+                    frames.append(result)
 
-        # Read tick data — duka CSV format: time, ask, bid, ask_volume, bid_volume
-        all_frames = []
-        for csv_file in csv_files:
-            try:
-                df = pd.read_csv(
-                    csv_file,
-                    names=["datetime", "ask", "bid", "ask_volume", "bid_volume"],
-                    parse_dates=["datetime"],
-                    header=0,
-                )
-                all_frames.append(df)
-            except Exception as e:
-                logger.warning(f"Failed to parse CSV {csv_file}: {e}")
+    if not frames:
+        raise ValueError(
+            f"No data returned from Dukascopy for {symbol} ({duka_symbol}) "
+            f"between {date_from} and {date_to}. "
+            "The symbol may be unsupported or the date range may have no trading data."
+        )
 
-        if not all_frames:
-            raise ValueError(f"Failed to parse any tick data files for {symbol}")
+    ticks = pd.concat(frames, ignore_index=True).sort_values("datetime")
 
-        ticks = pd.concat(all_frames, ignore_index=True)
-
-    if ticks.empty:
-        raise ValueError(f"No tick data available for {symbol} in the requested range")
-
-    # Convert to UTC-aware datetime
-    ticks["datetime"] = pd.to_datetime(ticks["datetime"], utc=True)
-
-    # Calculate mid price for OHLCV
+    # Mid price
     ticks["price"] = (ticks["ask"] + ticks["bid"]) / 2
     ticks["volume"] = ticks["ask_volume"] + ticks["bid_volume"]
 
-    # Set datetime as index for resampling
-    ticks = ticks.set_index("datetime").sort_index()
-
-    # Remove duplicates
+    ticks = ticks.set_index("datetime")
     ticks = ticks[~ticks.index.duplicated(keep="first")]
 
-    # Resample to 1-minute OHLCV bars
-    ohlcv = pd.DataFrame()
-    ohlcv["open"] = ticks["price"].resample("1min").first()
-    ohlcv["high"] = ticks["price"].resample("1min").max()
-    ohlcv["low"] = ticks["price"].resample("1min").min()
-    ohlcv["close"] = ticks["price"].resample("1min").last()
-    ohlcv["volume"] = ticks["volume"].resample("1min").sum()
+    # Resample to 1-minute OHLCV
+    ohlcv = pd.DataFrame(
+        {
+            "open": ticks["price"].resample("1min").first(),
+            "high": ticks["price"].resample("1min").max(),
+            "low": ticks["price"].resample("1min").min(),
+            "close": ticks["price"].resample("1min").last(),
+            "volume": ticks["volume"].resample("1min").sum(),
+        }
+    )
+    ohlcv = ohlcv.dropna(subset=["open"]).reset_index()
 
-    # Drop rows with no trading activity (weekends, holidays)
-    ohlcv = ohlcv.dropna(subset=["open"])
-
-    # Reset index so datetime is a column
-    ohlcv = ohlcv.reset_index()
-    ohlcv = ohlcv.rename(columns={"index": "datetime"} if "index" in ohlcv.columns else {})
-
-    # Ensure datetime column name
-    if "datetime" not in ohlcv.columns and ohlcv.index.name == "datetime":
-        ohlcv = ohlcv.reset_index()
-
-    logger.info(f"Fetched {len(ohlcv)} 1-minute bars for {symbol}")
-
+    logger.info("Fetched %d 1-minute bars for %s", len(ohlcv), symbol)
     return ohlcv

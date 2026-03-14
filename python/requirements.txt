@@ -1,6 +1,6 @@
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
-duka==0.2.0
+httpx==0.28.1
 yfinance==0.2.50
 pandas==2.2.3
 pyarrow==18.1.0
